@@ -1,0 +1,310 @@
+/* Edel AI Chatbot フローティングUI スタイル */
+
+/* コンテナ全体: 右下に固定 */
+#edel_ai_chatbot_widget-container {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    z-index: 9999; /* 他の要素より手前に表示 */
+}
+
+/* チャット起動ボタン (アイコン) */
+.edel-chatbot-open-button {
+    background-color: #007bff; /* 例: 青色 */
+    color: white;
+    border: none;
+    border-radius: 50%; /* 円形 */
+    width: 60px; /* ボタンサイズ */
+    height: 60px; /* ボタンサイズ */
+    font-size: 24px; /* アイコンサイズ調整 */
+    cursor: pointer;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+    display: flex; /* アイコンとテキスト(隠す場合も)を中央揃え */
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.2s ease;
+    /* 必要ならここにさらにスタイルを追加 */
+}
+.edel-chatbot-open-button:hover {
+    transform: scale(1.1); /* ホバー時に少し拡大 */
+}
+.edel-chatbot-button-text {
+    /* 必要に応じてテキストを表示・非表示・調整 */
+    display: none; /* 例: デフォルトではアイコンのみ表示 */
+}
+
+/* チャットウィンドウ本体 */
+.edel-chatbot-window {
+    width: 350px; /* 幅の例 (調整可能) */
+    max-height: calc(100vh - 120px); /* 画面高さから少し余裕を持たせた最大高さ */
+    background-color: #fff;
+    border-radius: 8px;
+    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+    display: none; /* ★初期状態は非表示★ */
+    flex-direction: column; /* ウィンドウ内の要素を縦に並べる */
+    overflow: hidden; /* 角丸や内部要素のはみだし制御 */
+    position: absolute; /* コンテナ内の絶対位置 */
+    bottom: 80px; /* ボタン(高さ60px + 余白20px)の上に表示 */
+    right: 0;
+
+    /* 開閉アニメーション用 (例: フェードイン＆少し上に移動) */
+    opacity: 0;
+    transform: translateY(10px);
+    transition: opacity 0.3s ease, transform 0.3s ease, visibility 0.3s; /* visibilityも追加 */
+    visibility: hidden; /* display:noneの代わりに */
+    transition: opacity 0.3s ease, transform 0.3s ease, visibility 0.3s, width 0.3s ease, height 0.3s ease, bottom 0.3s ease, right 0.3s ease, top 0.3s ease, left 0.3s ease; /
+}
+
+/* ウィンドウが表示されるときのスタイル (.is-visible クラスが付与された時) */
+.edel-chatbot-window.is-visible {
+    display: flex; /* ★表示状態にする (flexbox)★ */
+    opacity: 1;
+    transform: translateY(0);
+    visibility: visible; /* 表示 */
+}
+
+/* ヘッダー */
+.edel-chatbot-header {
+    background-color: #f1f1f1;
+    padding: 10px 15px;
+    border-bottom: 1px solid #ddd;
+    display: flex;
+    justify-content: space-between; /* タイトルとボタングループを両端に */
+    align-items: center;
+    flex-shrink: 0;
+}
+.edel-chatbot-title {
+    font-weight: bold;
+}
+
+/* ヘッダー内のボタングループ */
+.edel-chatbot-header > div {
+    display: flex; /* ボタンを横に並べる */
+    align-items: center;
+    gap: 5px; /* ボタン間の隙間 */
+}
+
+.edel-chatbot-maximize-button {
+    font-size: 14px; /* アイコンのサイズを調整 (閉じるボタンの16pxより少し小さくなど) */
+}
+
+/* ヘッダーボタン共通スタイル */
+.edel-chatbot-header-button {
+    background: none;
+    border: none;
+    /* font-size: 18px; */ /* ← SVGサイズはここで調整可能 */
+    cursor: pointer;
+    padding: 5px; /* SVG周りの余白を調整 */
+    color: #666; /* アイコンの色 */
+    border-radius: 3px;
+    transition: background-color 0.2s, color 0.2s;
+    display: inline-flex; /* SVGを中央揃えにしやすくする */
+    align-items: center;
+    justify-content: center;
+    width: 28px; /* 固定幅の例 */
+    height: 28px; /* 固定高さの例 */
+}
+.edel-chatbot-header-button:hover {
+    background-color: #e0e0e0;
+    color: #000;
+}
+.edel-chatbot-header-button svg {
+    width: 1em;
+    height: 1em;
+    display: block;
+    margin: auto; /* 中央揃え */
+    vertical-align: middle; /* 垂直位置調整 */
+}
+
+/* 閉じるボタン固有スタイル */
+.edel-chatbot-close-button {
+    font-size: 16px; /* アイコンのサイズを調整 */
+}
+
+/* 拡大ボタン固有スタイル */
+.edel-chatbot-maximize-button {
+    font-size: 14px; /* アイコンのサイズを調整 (まだ文字だけど) */
+}
+.edel-chatbot-title {
+    font-weight: bold;
+}
+.edel-chatbot-close-button {
+    background: none;
+    border: none;
+    font-size: 24px; /* 少し大きく */
+    line-height: 1; /* ボタン高さ調整 */
+    cursor: pointer;
+    padding: 0 5px;
+    color: #666;
+}
+.edel-chatbot-close-button:hover {
+    color: #000;
+}
+
+/* 会話履歴エリア */
+.edel-chatbot-history {
+    flex-grow: 1;
+    height: 300px; /* 高さ調整が必要な場合あり */
+    overflow-y: auto;
+    padding: 15px 10px; /* 左右のパディングを少し調整 */
+    background-color: #fff;
+    display: flex; /* ★ メッセージを縦に並べる */
+    flex-direction: column;
+    gap: 10px; /* ★ メッセージ間の隙間 */
+}
+/* メッセージ共通スタイル */
+.edel-chatbot-message {
+    /* floatとclearは不要に */
+    /* float: left; */
+    /* clear: both; */
+    max-width: 85%; /* 最大幅 */
+    /* display: flex; */ /* アイコン追加時に使うかも */
+    /* align-items: flex-end; */
+}
+.edel-chatbot-message p {
+    margin: 0;
+    padding: 10px 15px; /* パディング調整 */
+    border-radius: 18px; /* 角丸を調整 */
+    line-height: 1.45;   /* 行間調整 */
+    word-wrap: break-word; /* 長い単語の折り返し */
+    word-break: break-word; /* ↑と合わせて念のため */
+    white-space: pre-wrap;   /* ★★★ これを追加 ★★★ */
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05); /* ★ 軽い影を追加 (オプション) */
+    /* position: relative; */ /* しっぽ追加時に使うかも */
+}
+
+/* ボットからのメッセージ */
+.edel-chatbot-message-bot {
+    align-self: flex-start; /* ★ 左寄せにする */
+}
+.edel-chatbot-message-bot p {
+    background-color: #e9e9eb; /* 少し明るいグレー */
+    color: #000;
+    border-bottom-left-radius: 5px; /* ★ 左下の角だけ少し変えて吹き出しっぽく */
+}
+
+/* ユーザーからのメッセージ */
+.edel-chatbot-message-user {
+    align-self: flex-end; /* ★ 右寄せにする */
+}
+.edel-chatbot-message-user p {
+    background-color: #0b93f6; /* 少し明るい青 */
+    color: #fff;
+    border-bottom-right-radius: 5px; /* ★ 右下の角だけ少し変えて吹き出しっぽく */
+}
+
+/* フォームエリア */
+.edel-chatbot-form {
+    display: flex;
+    padding: 10px;
+    background-color: #f1f1f1;
+    border-top: 1px solid #ddd;
+    align-items: center;
+    flex-shrink: 0; /* フォームエリアは縮まないように */
+}
+.edel-chatbot-form textarea {
+    flex-grow: 1;
+    padding: 8px 12px;
+    border: 1px solid #ccc;
+    border-radius: 18px; /* 角丸 */
+    margin-right: 5px;
+    resize: none; /* リサイズハンドル非表示 */
+    min-height: 36px; /* 最小高さ (1行分くらい) */
+    max-height: 120px; /* 最大高さ */
+    overflow-y: auto; /* 必要ならスクロール */
+    font-family: inherit;
+    line-height: 1.4;
+    box-sizing: border-box; /* padding, border を含めて高さを計算 */
+}
+.edel-chatbot-submit-button {
+    background: none;
+    border: none;
+    padding: 8px; /* クリック領域確保 */
+    cursor: pointer;
+    color: #007bff;
+    font-size: 20px;
+    line-height: 1; /* ボタン高さ調整 */
+    margin-left: 5px;
+    /* margin-bottom: 2px; */
+    flex-shrink: 0; /* ボタンは縮まない */
+}
+/* ローディングスタイル */
+.edel-chatbot-loading {
+    display: none;
+    margin-left: 10px;
+    vertical-align: middle;
+} /* 初期非表示 */
+.edel-chatbot-loading span {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin: 0 1px;
+    background-color: #aaa;
+    border-radius: 50%;
+    animation: edel-chatbot-loading-blink 1.4s infinite both;
+}
+.edel-chatbot-loading span:nth-child(1) {
+    animation-delay: 0.2s;
+}
+.edel-chatbot-loading span:nth-child(2) {
+    animation-delay: 0.4s;
+}
+.edel-chatbot-loading span:nth-child(3) {
+    animation-delay: 0.6s;
+}
+@keyframes edel-chatbot-loading-blink {
+    0% {
+        opacity: 0.2;
+    }
+    20% {
+        opacity: 1;
+    }
+    100% {
+        opacity: 0.2;
+    }
+}
+
+/* ★★★ ウィンドウ拡大時のスタイル ★★★ */
+.edel-chatbot-window.is-maximized {
+    /* --- 位置とサイズ --- */
+    position: fixed;   /* ★ fixed に変更または確認 (ビューポート基準になる) */
+    width: 80vw;       /* 画面幅の80% (調整可能) */
+    max-width: 800px;  /* 最大幅 (調整可能) */
+    height: 75vh;      /* 画面高さの75% (調整可能) */
+    max-height: none;  /* 通常時のmax-heightを解除 */
+
+    /* --- 中央配置 --- */
+    top: 50%;          /* ★ 上端を画面中央へ */
+    left: 50%;         /* ★ 左端を画面中央へ */
+    transform: translate(-50%, -50%); /* ★ 要素自身の大きさ分を戻して完全に中央へ */
+
+    /* --- 通常時の位置指定を解除 --- */
+    bottom: auto;      /* ★ bottom指定を解除 */
+    right: auto;       /* ★ right指定を解除 */
+
+    opacity: 1;
+
+    /* transition は既存のものでOK */
+}
+
+/* ★★★ 拡大時の会話履歴エリアの高さ調整 ★★★ */
+.edel-chatbot-window.is-maximized .edel-chatbot-history {
+    height: auto; /* 高さを自動にしてflex-growで伸びるように */
+    /* または、固定の高さを指定しても良い */
+    /* height: calc(75vh - 100px); */ /* 例: 全体高さからヘッダーとフッター分を引く */
+}
+
+/* (オプション) 拡大時に起動ボタンを完全に隠すなど */
+#edel_ai_chatbot_widget-container .is-maximized ~ .edel-chatbot-open-button {
+    /* display: none; */
+}
+
+/* エラーメッセージ用のスタイル */
+.edel-chatbot-message-error p {
+    background-color: #ffebee; /* 例: 薄い赤系の背景色 */
+    color: #c62828; /* 例: 少し濃い赤系の文字色 */
+    border: 1px solid #ef9a9a; /* 例: 赤系の枠線 */
+    /* アイコンを追加する場合 (Font AwesomeやSVGなど) */
+    /* position: relative; */
+    /* padding-left: 30px; */ /* アイコン分のスペース */
+}
