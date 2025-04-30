@@ -1,11 +1,13 @@
 /* Edel AI Chatbot フローティングUI スタイル */
 
 /* コンテナ全体: 右下に固定 */
-#edel_ai_chatbot_widget-container {
-    position: fixed;
-    bottom: 20px;
-    right: 20px;
-    z-index: 9999; /* 他の要素より手前に表示 */
+#edel_ai_chatbot_plus_widget-container {
+    position: fixed;   /* 画面基準で固定表示 */
+    bottom: 20px;      /* 下から20pxの位置 */
+    right: 20px;       /* ★★★ 右から20pxの位置 ★★★ ← これが重要！ */
+    left: auto;        /* ★ 左からの位置指定は自動（または指定しない） */
+    top: auto;         /* ★ 上からの位置指定は自動（または指定しない） */
+    z-index: 9999;     /* 他の要素より手前に表示 */
 }
 
 /* チャット起動ボタン (アイコン) */
@@ -295,7 +297,7 @@
 }
 
 /* (オプション) 拡大時に起動ボタンを完全に隠すなど */
-#edel_ai_chatbot_widget-container .is-maximized ~ .edel-chatbot-open-button {
+#edel_ai_chatbot_plus_widget-container .is-maximized ~ .edel-chatbot-open-button {
     /* display: none; */
 }
 

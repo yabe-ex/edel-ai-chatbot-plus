@@ -150,9 +150,14 @@ class EdelAiChatbotOpenAIAPI {
             return new WP_Error('api_error', $error_message, ['status' => $response_code, 'body' => $response_body]);
         }
 
+        $response_text = trim($decoded_body['choices'][0]['message']['content']);
+        error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Chat completion result: ' . substr($response_text, 0, 100) . '...'); // 長い場合に備えて一部だけログ
+
         // 成功：応答テキストを返す
         return trim($decoded_body['choices'][0]['message']['content']);
     }
+
+
 
     // --- 将来的に Chat API 用のメソッドもここに追加できる ---
     // public function get_chat_completion(...) { ... }

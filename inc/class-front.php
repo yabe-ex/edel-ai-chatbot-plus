@@ -2,6 +2,7 @@
 
 namespace Edel\AiChatbotPlus\Front;
 
+use \WP_Error;
 use \Exception;
 use Edel\AiChatbotPlus\API\EdelAiChatbotOpenAIAPI;
 
@@ -10,13 +11,9 @@ class EdelAiChatbotFront {
         $version  = (defined('EDEL_AI_CHATBOT_PLUS_DEVELOP') && true === EDEL_AI_CHATBOT_PLUS_DEVELOP) ? time() : EDEL_AI_CHATBOT_PLUS_VERSION;
         $strategy = array('in_footer' => true, 'strategy'  => 'defer');
 
-        // スタイル登録
         wp_register_style(EDEL_AI_CHATBOT_PLUS_SLUG . '-front',  EDEL_AI_CHATBOT_PLUS_URL . '/css/front.css', array(), $version);
-        // スクリプト登録
         wp_register_script(EDEL_AI_CHATBOT_PLUS_SLUG . '-front', EDEL_AI_CHATBOT_PLUS_URL . '/js/front.js', array('jquery'), $version, $strategy);
 
-        // ★★★ 必要な時にスタイルとスクリプトを読み込む ★★★
-        // ショートコードが使われる可能性があるページで読み込む（例：常に読み込む場合）
         wp_enqueue_style(EDEL_AI_CHATBOT_PLUS_SLUG . '-front');
         wp_enqueue_script(EDEL_AI_CHATBOT_PLUS_SLUG . '-front');
 
@@ -90,9 +87,7 @@ class EdelAiChatbotFront {
                 </div>
                 <div id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX; ?>history" class="edel-chatbot-history">
                     <div class="edel-chatbot-message edel-chatbot-message-bot">
-                        <div class="edel-chatbot-message edel-chatbot-message-bot">
-                            <p><?php echo nl2br(esc_html($greeting_message)); ?></p>
-                        </div>
+                        <p><?php echo nl2br(esc_html($greeting_message)); ?></p>
                     </div>
                 </div>
 
@@ -146,6 +141,7 @@ class EdelAiChatbotFront {
      * フロントエンドからのチャットメッセージ受信Ajaxハンドラ (修正)
      */
     public function handle_send_message() {
+        error_log('--- handle_send_message METHOD CALLED! ---');
         error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' handle_send_message started.'); // ★ログ追加 (開始)
 
         global $wpdb; // DBアクセス用
@@ -283,7 +279,7 @@ class EdelAiChatbotFront {
      * @param array $vecB ベクトルB (floatの配列)
      * @return float|false 類似度 (-1から1、通常は0以上) またはエラー時 false
      */
-    private function calculate_cosine_similarity(array $vecA, array $vecB): float|false {
+    private function calculate_cosine_similarity(array $vecA, array $vecB) {
         $dotProduct = 0.0;
         $normA = 0.0;
         $normB = 0.0;

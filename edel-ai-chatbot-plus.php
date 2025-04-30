@@ -55,12 +55,18 @@ class EdelAiChatbotPlus {
         add_filter('plugin_action_links_' . EDEL_AI_CHATBOT_PLUS_BASENAME, array($this->admin_instance, 'plugin_action_links'));
         add_action('admin_enqueue_scripts', array($this->admin_instance, 'admin_enqueue'));
 
+        $learning_action_hook = EDEL_AI_CHATBOT_PLUS_PREFIX . 'process_post_learning';
+        add_action($learning_action_hook, array($this->admin_instance, 'process_single_post_learning'), 10, 1);
+
         add_action('wp_enqueue_scripts', array($this->front_instance, 'front_enqueue'));
         add_action('wp_footer', array($this->front_instance, 'output_floating_chatbot_ui'));
 
         $ajax_action = EDEL_AI_CHATBOT_PLUS_PREFIX . 'send_message';
         add_action('wp_ajax_' . $ajax_action, array($this->front_instance, 'handle_send_message'));
         add_action('wp_ajax_nopriv_' . $ajax_action, array($this->front_instance, 'handle_send_message'));
+
+        $batch_ajax_action = EDEL_AI_CHATBOT_PLUS_PREFIX . 'batch_learning'; // JSで指定したaction名
+        add_action('wp_ajax_' . $batch_ajax_action, array($this->admin_instance, 'handle_batch_learning_ajax'));
     }
 }
 
