@@ -2,9 +2,11 @@
 
 namespace Edel\AiChatbotPlus\Front;
 
+use Edel\AiChatbotPlus\API\EdelAiChatbotOpenAIAPI;
+use Edel\AiChatbotPlus\API\EdelAiChatbotPlusPineconeClient;
 use \WP_Error;
 use \Exception;
-use Edel\AiChatbotPlus\API\EdelAiChatbotOpenAIAPI;
+use \Throwable;
 
 class EdelAiChatbotFront {
     function front_enqueue() {
@@ -169,13 +171,41 @@ class EdelAiChatbotFront {
             $api_key = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'] ?? '';
             $chat_model = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'model'] ?? 'gpt-3.5-turbo'; // 設定されたChatモデル
 
-            if (empty($api_key)) {
-                throw new Exception('OpenAI APIキーが設定されていません。');
+            $ai_service = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'] ?? 'openai';
+
+            $openai_api_key        = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'] ?? '';
+            $openai_chat_model     = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'model'] ?? 'gpt-3.5-turbo';
+            $google_api_key        = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'google_api_key'] ?? '';
+            $gemini_chat_model     = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'] ?? 'gemini-1.5-flash';
+
+            $pinecone_api_key     = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_api_key'] ?? '';
+            $pinecone_environment = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_environment'] ?? '';
+            $pinecone_index_name  = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_index_name'] ?? '';
+            $pinecone_host        = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_host'] ?? '';
+
+            if ($ai_service === 'openai' && empty($openai_api_key)) {
+                throw new \Exception('OpenAI APIキーが設定されていません。');
             }
+            if ($ai_service === 'gemini' && empty($google_api_key)) {
+                throw new \Exception('Google APIキーが設定されていません。');
+            }
+
+            if (empty($api_key) || empty($pinecone_api_key) || empty($pinecone_environment) || empty($pinecone_index_name) || empty($pinecone_host)) {
+                throw new Exception('APIキーまたはPinecone設定が不足しています。管理画面で設定を確認してください。');
+            }
+            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' API Key and Pinecone settings found...');
 
             // --- APIクライアント準備 ---
             require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-openai-api.php'; // クラスファイル読み込み
             $openai_api = new EdelAiChatbotOpenAIAPI($api_key);
+
+            require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-pinecone-client.php';
+            $pinecone_client = new \Edel\AiChatbotPlus\API\EdelAiChatbotPlusPineconeClient(
+                $pinecone_api_key,
+                $pinecone_environment,
+                $pinecone_index_name,
+                $pinecone_host
+            );
 
             // --- (a) 質問のベクトル化 ---
             error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Got question embedding. Starting similarity search...');
@@ -183,66 +213,62 @@ class EdelAiChatbotFront {
             if (is_wp_error($question_vector)) {
                 throw new Exception('質問のベクトル化に失敗しました: ' . $question_vector->get_error_message());
             }
+            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Got question embedding. Querying Pinecone...');
 
-            // --- (b) 類似ベクトル検索 ---
-            // DBから全てのベクトルデータを取得 (★パフォーマンス注意★)
-            $results = $wpdb->get_results("SELECT id, source_text, vector_data FROM {$vector_table_name}");
+            $top_n = 3; // 取得する類似チャンク数
+            $query_result = $pinecone_client->query(
+                $question_vector,
+                $top_n,
+                null, // filter (必要なら追加)
+                null, // namespace (必要なら追加)
+                true, // includeMetadata (メタデータを取得)
+                false // includeValues (ベクトル値は不要)
+            );
 
-            // 類似度を格納する配列を初期化
-            $similarities = [];
+            if (is_wp_error($query_result)) {
+                throw new \Exception('Pineconeでの類似情報検索に失敗しました: ' . $query_result->get_error_message());
+            }
 
-            if (empty($results)) {
-                // 学習データがない場合
-                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' No learning data found in DB.');
-                // $similarities は空のまま
+            $context_chunks = []; // まず空で初期化
+            if (isset($query_result['matches']) && is_array($query_result['matches'])) {
+                // Pineconeが返した matches 配列をそのまま使う (topKで件数指定済みのため)
+                $context_chunks = $query_result['matches'];
             } else {
-                // 類似度計算ループ
-                foreach ($results as $row) {
-                    $db_vector = json_decode($row->vector_data, true); // JSON文字列をPHP配列に
-                    if (is_array($db_vector)) {
-                        // コサイン類似度を計算
-                        $similarity = $this->calculate_cosine_similarity($question_vector, $db_vector);
-                        if ($similarity !== false) {
-                            // 結果を配列に追加
-                            $similarities[] = [
-                                'id'         => $row->id,
-                                'text'       => $row->source_text,
-                                'similarity' => $similarity
-                            ];
-                        }
-                    } else {
-                        // JSONデコード失敗などのエラーログ
-                        error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' DB Error: Failed to decode vector data for ID ' . $row->id);
-                    }
-                } // end foreach
-
-                // 類似度で降順ソート (結果がある場合のみ)
-                if (!empty($similarities)) {
-                    usort($similarities, function ($a, $b) {
-                        // $b['similarity'] が $a['similarity'] より大きければ -1 を返す (降順)
-                        return $b['similarity'] <=> $a['similarity'];
-                    });
-                }
-            } // end if !empty($results)
-
-            // 上位N件を取得 (例: 3件)
-            $top_n = 3;
-            // $similarities が空でも array_slice は空配列を返すので問題ない
-            $context_chunks = array_slice($similarities, 0, $top_n); // ★★★ $context_chunks はここで定義される ★★★
+                // matches がないか配列でない場合 (エラー応答など)
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Pinecone query did not return expected matches array. Response: ' . print_r($query_result, true));
+            }
 
             // ★★★ ログの位置を $context_chunks 定義後に移動 ★★★
-            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Similarity search done. Found ' . count($context_chunks) . ' context chunks. Creating prompt...');
+            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Pinecone query done. Found ' . count($context_chunks) . ' matches. Creating prompt...');
 
             // --- (c) プロンプト作成 ---
             $context_text = '';
-            if (!empty($context_chunks)) { // $context_chunks は定義済みなので Warning は出ないはず
+            $context_chunks_count = 0;
+            // Pineconeの応答形式 ('matches' 配列) からメタデータを抽出
+            if (isset($query_result['matches']) && !empty($query_result['matches'])) {
                 $context_text = "以下は関連する可能性のある情報です。これを参考に回答してください。\n---\n";
-                foreach ($context_chunks as $chunk) {
-                    $context_text .= $chunk['text'] . "\n---\n";
+                foreach ($query_result['matches'] as $match) {
+                    // score や metadata は存在するか確認する方が安全
+                    $text_preview = $match['metadata']['text_preview'] ?? ''; // メタデータからテキストプレビュー取得
+                    $similarity_score = $match['score'] ?? 0; // 類似度スコアも取得可能
+
+                    // (オプション) 類似度スコアが低いものは除外する
+                    // if ($similarity_score < 0.7) continue;
+
+                    if (!empty($text_preview)) {
+                        $context_text .= $text_preview . "\n---\n"; // プレビューをコンテキストに追加
+                        $context_chunks_count++;
+                    }
+                    // (注意) text_preview だけだと情報が足りない場合は、
+                    // source_post_id を使ってDBから完全な source_text を引く処理が必要になる場合も
                 }
-            } else {
+            }
+
+            if ($context_chunks_count === 0) {
                 $context_text = "関連情報は見つかりませんでした。";
-                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' No relevant context chunks found.'); // 関連情報がない場合もログ
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' No relevant context chunks found from Pinecone.');
+            } else {
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Found ' . $context_chunks_count . ' context chunks from Pinecone.');
             }
 
             // OpenAIに渡すメッセージ配列を作成
@@ -253,12 +279,46 @@ class EdelAiChatbotFront {
 
             // --- (d) 応答生成 ---
             error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Calling get_chat_completion...'); // Chat API呼び出し前のログ
-            $bot_response = $openai_api->get_chat_completion($messages, $chat_model);
+            $bot_response =  '';
 
-            if (is_wp_error($bot_response)) {
-                throw new Exception('AIからの応答生成に失敗しました: ' . $bot_response->get_error_message());
+            if ($ai_service === 'gemini') {
+                // === Google Gemini の場合 ===
+                // APIクライアント準備 (Gemini Chat用)
+                require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-google-gemini-api.php';
+                $gemini_api = new \Edel\AiChatbotPlus\API\EdelAiChatbotPlusGeminiAPI($google_api_key);
+
+                // プロンプトを Gemini API の contents 形式に変換
+                $prompt_text = $context_text . "\n\nユーザーの質問:\n" . $user_message;
+                $gemini_contents = [
+                    [
+                        'role' => 'user', // userロールにコンテキストと質問を入れる
+                        'parts' => [['text' => $prompt_text]]
+                    ]
+                    // 必要ならシステム指示を別の形で追加（モデルによる）
+                ];
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Calling Gemini API (' . $gemini_chat_model . ')');
+                $bot_response_or_error = $gemini_api->generateContent($gemini_contents, $gemini_chat_model);
+            } else {
+                // === OpenAI の場合 (デフォルト) ===
+                // APIクライアント準備 (OpenAI Chat用 - Embeddingと同じキーを使う)
+                $openai_chat_client = $openai_embedding_client; // 同じインスタンスでOK
+
+                // プロンプトを OpenAI API の messages 形式に変換
+                $openai_messages = [
+                    ['role' => 'system', 'content' => "あなたは親切なAIアシスタントです。提供された情報を元に、ユーザーの質問に日本語で回答してください。情報がない場合は、正直に「分かりません」と答えてください。"],
+                    ['role' => 'user', 'content' => $context_text . "\n\nユーザーの質問:\n" . $user_message]
+                ];
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Calling OpenAI Chat API (' . $openai_chat_model . ')');
+                $bot_response_or_error = $openai_chat_client->get_chat_completion($openai_messages, $openai_chat_model);
             }
+            // API応答チェック
+            if (is_wp_error($bot_response_or_error)) {
+                throw new \Exception('AIからの応答生成に失敗しました: ' . $bot_response_or_error->get_error_message());
+            }
+            $bot_response = $bot_response_or_error; // 正常な応答テキスト
+            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' AI response received.');
 
+            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Sending success JSON.');
             wp_send_json_success(['message' => $bot_response]);
         } catch (Exception $e) {
             error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Exception caught in handle_send_message: ' . $e->getMessage());

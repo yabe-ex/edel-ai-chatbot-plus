@@ -22,6 +22,8 @@ if (!defined('ABSPATH')) exit();
 use Edel\AiChatbotPlus\Admin\EdelAiChatbotAdmin;
 use Edel\AiChatbotPlus\Front\EdelAiChatbotFront;
 use Edel\AiChatbotPlus\API\EdelAiChatbotOpenAIAPI;
+use Edel\AiChatbotPlus\API\EdelAiChatbotPlusPineconeClient;
+use Edel\AiChatbotPlus\API\EdelAiChatbotPlusGeminiAPI;
 use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
 
 $info = get_file_data(__FILE__, array('plugin_name' => 'Plugin Name', 'version' => 'Version'));
@@ -38,6 +40,8 @@ define('EDEL_AI_CHATBOT_PLUS_DEVELOP', true);
 require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-admin.php';
 require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-front.php';
 require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-openai-api.php';
+require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-pinecone-client.php';
+require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-google-gemini-api.php';
 
 register_activation_hook(__FILE__, array(Admin\EdelAiChatbotAdmin::class, 'create_custom_table'));
 

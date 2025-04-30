@@ -201,9 +201,14 @@ class EdelAiChatbotAdmin {
         $options = get_option($option_name, []);
         $api_key = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'] ?? '';
 
-        if (empty($api_key)) {
-            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Error: API Key not found for post ID: ' . $post_id);
-            return;
+        $pinecone_api_key     = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_api_key'] ?? '';
+        $pinecone_environment = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_environment'] ?? '';
+        $pinecone_index_name  = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_index_name'] ?? '';
+        $pinecone_host        = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_host'] ?? '';
+
+        if (empty($api_key) || empty($pinecone_api_key) || empty($pinecone_environment) || empty($pinecone_index_name) || empty($pinecone_host)) {
+            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Error: OpenAI API Key or Pinecone settings are missing for post ID: ' . $post_id);
+            return ['status' => 'error', 'message' => 'APIキーまたはPinecone設定が不足しています。'];
         }
 
         try {
@@ -259,6 +264,14 @@ class EdelAiChatbotAdmin {
                 require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-openai-api.php';
                 $openai_api = new \Edel\AiChatbotPlus\API\EdelAiChatbotOpenAIAPI($api_key); // use宣言があれば短い名前で
 
+                require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-pinecone-client.php'; // ファイル読み込み
+                $pinecone_client = new \Edel\AiChatbotPlus\API\EdelAiChatbotPlusPineconeClient( // use宣言があれば \Namespace\ は不要
+                    $pinecone_api_key,
+                    $pinecone_environment,
+                    $pinecone_index_name,
+                    $pinecone_host
+                );
+
                 // 8. チャンクループ: ベクトル化とDB保存
                 $post_chunks_saved = 0;
                 $post_errors = 0;
@@ -269,20 +282,26 @@ class EdelAiChatbotAdmin {
                             throw new \Exception($vector->get_error_message());
                         }
 
-                        $vector_json = json_encode($vector);
-                        $inserted = $wpdb->insert(
-                            $vector_table_name,
-                            [
-                                'source_post_id' => $post_id,
-                                'source_post_modified' => $current_modified_gmt, // ★ 現在の更新日時を保存
-                                'source_text'    => $chunk,
-                                'vector_data'    => $vector_json
-                            ],
-                            ['%d', '%s', '%s', '%s'] // ★ フォーマットに %s (datetime) を追加
-                        );
-                        if ($inserted === false) {
-                            throw new \Exception('DB保存失敗: ' . $wpdb->last_error);
+                        // $vector_json = json_encode($vector);
+
+                        $vector_id = $post_id . '-' . $chunk_index;
+                        // 保存するメタデータ
+                        $metadata = [
+                            'source_post_id' => $post_id,
+                            'text_preview'   => mb_substr(preg_replace('/\s+/', ' ', $chunk), 0, 100), // チャンク冒頭100文字(改行等除去)
+                            'modified_gmt'   => $current_modified_gmt, // 更新日時
+                            // 必要なら投稿タイトルなども追加: 'title' => $post->post_title
+                        ];
+
+                        // Pineconeクライアントの upsert メソッド呼び出し
+                        $upsert_result = $pinecone_client->upsert($vector_id, $vector, $metadata);
+
+                        if (is_wp_error($upsert_result)) {
+                            // Pineconeへの保存失敗
+                            throw new \Exception('Pinecone保存失敗: ' . $upsert_result->get_error_message());
                         }
+
+
                         $post_chunks_saved++;
                         // usleep(200000);
 
@@ -292,7 +311,8 @@ class EdelAiChatbotAdmin {
                     }
                 } // end foreach chunk
 
-                $log_message = sprintf('%d チャンク保存完了', $post_chunks_saved);
+                $log_message = sprintf('%d チャンクをPineconeに保存完了', $post_chunks_saved);
+
                 if ($post_errors > 0) {
                     $log_message .= sprintf(' (%d エラー)', $post_errors);
                 }
@@ -588,6 +608,29 @@ class EdelAiChatbotAdmin {
                 ? esc_url_raw(trim($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_host'])) // DB保存用には esc_url_raw が推奨
                 : '';
 
+            // ★★★ AIサービス選択の保存 ★★★
+            $options_to_save[EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'] = isset($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'])
+                ? sanitize_key($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service']) // 'openai' or 'gemini'
+                : 'openai'; // デフォルトはOpenAI
+
+            // ★★★ Google APIキーの保存 ★★★
+            $options_to_save[EDEL_AI_CHATBOT_PLUS_PREFIX . 'google_api_key'] = isset($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'google_api_key'])
+                ? sanitize_text_field(trim($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'google_api_key']))
+                : '';
+
+            // ★★★ Geminiモデル選択の保存 (例) ★★★
+            // (今回は 'gemini-1.5-flash' 固定とするか、選択肢を作るか)
+            $options_to_save[EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'] = isset($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'])
+                ? sanitize_key($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'])
+                : 'gemini-1.5-flash'; // デフォルト
+
+            if ($options_to_save[EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'] === 'openai') {
+                // OpenAIモデル保存処理 ...
+            } else {
+                // OpenAIモデル設定をクリアまたは保持 (どうするか決める)
+                // unset($options_to_save[EDEL_AI_CHATBOT_PLUS_PREFIX . 'model']);
+            }
+
             // データベースにオプションを保存
             update_option($option_name, $options_to_save);
 
@@ -616,7 +659,13 @@ class EdelAiChatbotAdmin {
         $pinecone_environment = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_environment'] ?? '';
         $pinecone_index_name  = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_index_name'] ?? '';
         $pinecone_host        = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_host'] ?? '';
+
+        $ai_service       = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'] ?? 'openai'; // デフォルト OpenAI
+        $google_api_key   = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'google_api_key'] ?? '';
+        $selected_openai_model = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'model'] ?? 'gpt-3.5-turbo'; // OpenAI用
+        $selected_gemini_model = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'] ?? 'gemini-1.5-flash'; // Gemini用
         // ★★★ 読み込み処理ここまで ★★★
+
     ?>
         <div class="wrap">
             <h1><?php echo esc_html(EDEL_AI_CHATBOT_PLUS_NAME); ?> 設定</h1>
@@ -638,6 +687,58 @@ class EdelAiChatbotAdmin {
                             <p class="description">チェックを外すと、サイト上にチャットボットが表示されなくなります。</p>
                         </td>
                     </tr>
+
+                    <tr id="ai-service-row">
+                        <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'; ?>">利用するAIサービス</label></th>
+                        <td>
+                            <select id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'; ?>" name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'; ?>">
+                                <option value="openai" <?php selected($ai_service, 'openai'); ?>>OpenAI</option>
+                                <option value="gemini" <?php selected($ai_service, 'gemini'); ?>>Google Gemini</option>
+                            </select>
+                            <p class="description">チャットの応答に使用するAIサービスを選択します。</p>
+                        </td>
+                    </tr>
+
+                    <?php // ★★★ OpenAI 設定 (Gemini選択時は非表示) ★★★
+                    ?>
+                    <tr class="openai-settings" style="<?php echo $ai_service !== 'openai' ? 'display: none;' : ''; ?>">
+                        <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'; ?>">OpenAI APIキー</label></th>
+                        <td>
+                            <input type="password" id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'; ?>" name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'; ?>" value="<?php echo esc_attr($api_key); ?>" class="regular-text" autocomplete="new-password">
+                            <p class="description">OpenAI Platform で取得したAPIキー。</p>
+                        </td>
+                    </tr>
+                    <tr class="openai-settings" style="<?php echo $ai_service !== 'openai' ? 'display: none;' : ''; ?>">
+                        <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'model'; ?>">OpenAI モデル</label></th>
+                        <td>
+                            <select id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'model'; ?>" name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'model'; ?>">
+                                <?php $openai_models = ['gpt-4' => 'GPT-4', 'gpt-4-turbo' => 'GPT-4 Turbo', 'gpt-3.5-turbo' => 'GPT-3.5 Turbo']; ?>
+                                <?php foreach ($openai_models as $value => $label) : ?>
+                                    <option value='<?php echo esc_attr($value); ?>' <?php selected($selected_openai_model, $value); ?>><?php echo esc_html($label); ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                        </td>
+                    </tr>
+
+                    <?php // ★★★ Google Gemini 設定 (OpenAI選択時は非表示) ★★★
+                    ?>
+                    <tr class="gemini-settings" style="<?php echo $ai_service !== 'gemini' ? 'display: none;' : ''; ?>">
+                        <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'google_api_key'; ?>">Google APIキー</label></th>
+                        <td>
+                            <input type="password" id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'google_api_key'; ?>" name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'google_api_key'; ?>" value="<?php echo esc_attr($google_api_key); ?>" class="regular-text" autocomplete="new-password">
+                            <p class="description">Google AI Studio で取得したAPIキー。</p>
+                        </td>
+                    </tr>
+                    <tr class="gemini-settings" style="<?php echo $ai_service !== 'gemini' ? 'display: none;' : ''; ?>">
+                        <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'; ?>">Gemini モデル</label></th>
+                        <td>
+                            <?php // 将来的に複数モデルに対応する場合は select にする
+                            ?>
+                            <input type="text" id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'; ?>" name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'; ?>" value="<?php echo esc_attr($selected_gemini_model); ?>" readonly class="regular-text">
+                            (現在は gemini-1.5-flash 固定です)
+                        </td>
+                    </tr>
+
                     <tr>
                         <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'; ?>">OpenAI APIキー</label></th>
                         <td>
@@ -649,23 +750,7 @@ class EdelAiChatbotAdmin {
                             <p class="description">OpenAIのAPIキーを入力してください。</p>
                         </td>
                     </tr>
-                    <tr>
-                        <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'model'; ?>">OpenAI モデル</label></th>
-                        <td>
-                            <?php
-                            $models = ['gpt-4' => 'GPT-4', 'gpt-4-turbo' => 'GPT-4 Turbo', 'gpt-3.5-turbo' => 'GPT-3.5 Turbo']; // 選択肢
-                            ?>
-                            <select id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'model'; ?>"
-                                name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'model'; ?>">
-                                <?php foreach ($models as $value => $label) : ?>
-                                    <option value='<?php echo esc_attr($value); ?>' <?php selected($selected_model, $value); ?>>
-                                        <?php echo esc_html($label); ?>
-                                    </option>
-                                <?php endforeach; ?>
-                            </select>
-                            <p class="description">利用するOpenAIのモデルを選択してください。</p>
-                        </td>
-                    </tr>
+
                     <tr>
                         <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'header_title'; ?>">チャットヘッダータイトル</label></th>
                         <td>
@@ -715,7 +800,28 @@ class EdelAiChatbotAdmin {
                         </td>
                     </tr>
                 </table>
-
+                <script>
+                    jQuery(document).ready(function($) {
+                        function toggleSettingsVisibility() {
+                            const selectedService = $('#<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'; ?>').val();
+                            if (selectedService === 'openai') {
+                                $('.openai-settings').show();
+                                $('.gemini-settings').hide();
+                            } else if (selectedService === 'gemini') {
+                                $('.openai-settings').hide();
+                                $('.gemini-settings').show();
+                            } else {
+                                // 念のため両方隠すなど
+                                $('.openai-settings').hide();
+                                $('.gemini-settings').hide();
+                            }
+                        }
+                        // 初期表示
+                        toggleSettingsVisibility();
+                        // 選択変更時
+                        $('#<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'; ?>').on('change', toggleSettingsVisibility);
+                    });
+                </script>
                 <hr>
                 <h2>自動学習設定 (Plus版機能)</h2>
                 <p>サイト内のコンテンツを自動的に読み込み、チャットボットの学習データとして登録するための設定です。（実際の学習実行機能は開発中です）</p>
@@ -783,10 +889,10 @@ class EdelAiChatbotAdmin {
                             <input type="password"
                                 id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_api_key'; ?>"
                                 name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_api_key'; ?>"
-                                value="<?php echo esc_attr($pinecone_api_key); // 読み込んだ値を表示 
+                                value="<?php echo esc_attr($pinecone_api_key); // 読み込んだ値を表示
                                         ?>"
                                 class="regular-text"
-                                autocomplete="new-password"> <?php // ブラウザの自動入力を抑制 
+                                autocomplete="new-password"> <?php // ブラウザの自動入力を抑制
                                                                 ?>
                             <p class="description">Pineconeコンソールで取得したAPIキーを入力してください。</p>
                         </td>
@@ -818,13 +924,13 @@ class EdelAiChatbotAdmin {
                     <tr>
                         <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_host'; ?>">Pinecone ホストURL (Endpoint)</label></th>
                         <td>
-                            <?php // URL入力には type="url" を使うとブラウザのバリデーションも効く 
+                            <?php // URL入力には type="url" を使うとブラウザのバリデーションも効く
                             ?>
                             <input type="url"
                                 id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_host'; ?>"
                                 name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_host'; ?>"
                                 value="<?php echo esc_attr($pinecone_host); ?>"
-                                class="large-text" <?php // URLは長いため large-text 
+                                class="large-text" <?php // URLは長いため large-text
                                                     ?>
                                 placeholder="例: https://your-index-xxxxxx.svc.your-env.pinecone.io">
                             <p class="description">Pineconeコンソールで確認できるインデックスのホストURL (Endpoint) を入力してください。</p>
