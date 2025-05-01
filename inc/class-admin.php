@@ -87,30 +87,27 @@ class EdelAiChatbotAdmin {
 
         // WP_Query の引数を準備
         $args = [
-            'post_type'      => $learning_post_types,
+            'post_type'      => get_post_types(['public' => true, 'show_ui' => true], 'names'), // 管理画面UIを持つ公開投稿タイプを全て取得
             'post_status'    => 'publish',
             'has_password'   => false,
             'posts_per_page' => $posts_per_page,
-            'paged'          => $paged, // ページネーション
+            'paged'          => $paged,
             'orderby'        => 'ID',
-            'order'          => 'DESC', // 新しいものから表示する場合
-            'meta_query'     => array(
-                'relation' => 'AND', // 複数の条件を組み合わせる場合は 'AND' または 'OR'
+            'order'          => 'DESC',
+            'meta_query'     => array( // 学習済み条件は使う
                 array(
-                    'key'     => '_edel_ai_vector_count', // このメタキーが存在し、
+                    'key'     => '_edel_ai_vector_count',
                     'compare' => 'EXISTS',
                 ),
                 array(
-                    'key'     => '_edel_ai_vector_count', // かつ、その値が
-                    'value'   => 0,                      // 0 より大きい
-                    'compare' => '>',
-                    'type'    => 'NUMERIC',              // 数値として比較
+                    'key'     => '_edel_ai_vector_count',
+                    'value'   => 0,
+                    'compare' => '>', // ★ 0より大きい条件は戻す ★
+                    'type'    => 'NUMERIC',
                 ),
             )
         ];
-        if (!empty($learning_categories)) {
-            $args['category__in'] = $learning_categories;
-        }
+
         if (!empty($exclude_ids)) {
             $args['post__not_in'] = $exclude_ids;
         }
@@ -401,26 +398,20 @@ class EdelAiChatbotAdmin {
     } // end display_admin_notices()
 
     public function add_post_row_actions(array $actions, \WP_Post $post): array {
-        // ★★★ ここの設定値読み込みと条件判定が怪しい ★★★
-        $option_name = EDEL_AI_CHATBOT_PLUS_PREFIX . 'settings';
-        $options = get_option($option_name, []);
-        // ↓ デフォルト値が ['post', 'page'] になっているか？
-        $learning_post_types = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'learning_post_types'] ?? ['post', 'page'];
-
-        // ↓ この if 文の条件が false になっている可能性が高い
-        if (in_array($post->post_type, $learning_post_types) && $post->post_status === 'publish' && empty($post->post_password)) {
+        if ($post->post_status === 'publish' && empty($post->post_password)) { // ← 投稿タイプチェックを削除
+            error_log('Edel AI Chatbot Plus: Adding action link for Post ID: ' . $post->ID);
             $nonce_action = EDEL_AI_CHATBOT_PLUS_PREFIX . 'learn_single_post_nonce';
             $nonce = wp_create_nonce($nonce_action);
             $learn_url = admin_url('admin.php?action=' . EDEL_AI_CHATBOT_PLUS_PREFIX . 'learn_post&post_id=' . $post->ID . '&_wpnonce=' . $nonce);
+            // ★ リンクを追加 ★
             $actions['edel_ai_learn'] = '<a href="' . esc_url($learn_url) . '" aria-label="' . esc_attr(sprintf(__('%s をAIに学習させる', 'edel-ai-chatbot-plus'), $post->post_title)) . '">AI学習</a>';
         } else {
-            // ★ (デバッグ用) 条件に一致しなかった理由をログに出力 ★
+            // スキップ理由ログ (投稿タイプ部分は不要に)
             error_log(
                 'Edel AI Chatbot Plus: Skipping action link for Post ID: ' . $post->ID . ' - Reason: ' .
-                    'Type Match? ' . (in_array($post->post_type, $learning_post_types) ? 'Yes' : 'No (' . $post->post_type . ')') .
-                    ', Is Published? ' . ($post->post_status === 'publish' ? 'Yes' : 'No (' . $post->post_status . ')') .
-                    ', No Password? ' . (empty($post->post_password) ? 'Yes' : 'No') .
-                    '. Learning types setting: [' . implode(',', $learning_post_types) . ']'
+                    // 'Type Match? Yes' . // タイプチェックは削除
+                    ' Is Published? ' . ($post->post_status === 'publish' ? 'Yes' : 'No (' . $post->post_status . ')') .
+                    ', No Password? ' . (empty($post->post_password) ? 'Yes' : 'No')
             );
         }
         return $actions;
@@ -711,12 +702,18 @@ class EdelAiChatbotAdmin {
                 $status = ($errors === 0) ? 'processed' : 'processed_with_errors';
                 $message = sprintf('%d チャンク保存完了', $saved_chunks) . ($errors > 0 ? sprintf(' (%d エラー)', $errors) : '');
                 error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Finished processing updated post ID: ' . $post_id . '. ' . $message);
-                if ($saved_chunks > 0 || ($saved_chunks === 0 && $errors === 0 && !empty($text_chunks))) { // チャンクがあってエラーなく0件保存、もありうる？ -> やはり saved_chunks > 0 のみが安全か
-                    // if ($status === 'processed' || $status === 'processed_with_errors') { // またはステータスで判断
+                if ($saved_chunks > 0) {
                     update_post_meta($post_id, '_edel_ai_last_learned_gmt', $current_modified_gmt);
                     update_post_meta($post_id, '_edel_ai_vector_count', $saved_chunks); // 保存したチャンク数を記録
                     update_post_meta($post_id, '_edel_ai_processed_gmt', current_time('mysql', 1)); // 現在のGMT時刻を保存
                     error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Post meta updated for post ID: ' . $post_id);
+                } else {
+                    // 保存されたチャンクが0の場合 (エラーがあったか、チャンクがなかったか)
+                    error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Post meta NOT updated for post ID: ' . $post_id . ' because saved_chunks is 0 (Errors: ' . $errors . ')');
+                    // 必要であれば、ここでベクトル数を0にするメタデータを保存しても良い
+                    // update_post_meta($post_id, '_edel_ai_vector_count', 0);
+                    // delete_post_meta($post_id, '_edel_ai_last_learned_gmt'); // 古い学習日時も消す？
+                    // delete_post_meta($post_id, '_edel_ai_processed_gmt');
                 }
                 return ['status' => $status, 'message' => $message];
             } else {
@@ -1377,7 +1374,7 @@ class EdelAiChatbotAdmin {
                 } else {
             ?>
                     <p>サイトの投稿や固定ページから自動的に学習されたデータの一覧です。</p>
-                    <table class="wp-list-table widefat striped fixed">
+                    <!-- <table class="wp-list-table widefat striped fixed">
                         <thead>
                             <tr>
                                 <th scope="col">タイトル</th>
@@ -1417,7 +1414,7 @@ class EdelAiChatbotAdmin {
                                 </tr>
                             <?php endforeach; ?>
                         </tbody>
-                    </table>
+                    </table> -->
             <?php
                 } // end if empty($auto_entries)
             } // end if $pinecone_client

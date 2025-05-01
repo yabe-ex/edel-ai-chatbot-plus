@@ -62,13 +62,11 @@ class EdelAiChatbotPlus {
         add_action('admin_enqueue_scripts', array($this->admin_instance, 'admin_enqueue'));
 
         $learning_action_hook = EDEL_AI_CHATBOT_PLUS_PREFIX . 'process_post_learning';
-        add_action($learning_action_hook, array($this->admin_instance, 'process_single_post_learning_cron'), 10, 1); // ← _cron を指定
+        add_action($learning_action_hook, array($this->admin_instance, 'process_single_post_learning_cron'), 10, 1);
 
-        // ★ Ajaxループ用アクションフック (変更なし、handle_batch_learning_ajax を呼ぶ) ★
         $batch_ajax_action = EDEL_AI_CHATBOT_PLUS_PREFIX . 'batch_learning';
         add_action('wp_ajax_' . $batch_ajax_action, array($this->admin_instance, 'handle_batch_learning_ajax'));
 
-        // ★ admin_action フック (変更なし、handle_learn_single_post_action を呼ぶ) ★
         $learn_action_name = EDEL_AI_CHATBOT_PLUS_PREFIX . 'learn_post';
         add_action('admin_action_' . $learn_action_name, array($this->admin_instance, 'handle_learn_single_post_action'));
 
@@ -79,7 +77,7 @@ class EdelAiChatbotPlus {
         add_action('wp_ajax_' . $ajax_action, array($this->front_instance, 'handle_send_message'));
         add_action('wp_ajax_nopriv_' . $ajax_action, array($this->front_instance, 'handle_send_message'));
 
-        $batch_ajax_action = EDEL_AI_CHATBOT_PLUS_PREFIX . 'batch_learning'; // JSで指定したaction名
+        $batch_ajax_action = EDEL_AI_CHATBOT_PLUS_PREFIX . 'batch_learning';
         add_action('wp_ajax_' . $batch_ajax_action, array($this->admin_instance, 'handle_batch_learning_ajax'));
 
         $learn_action_name = EDEL_AI_CHATBOT_PLUS_PREFIX . 'learn_post';
@@ -88,18 +86,30 @@ class EdelAiChatbotPlus {
         add_action('admin_notices', array($this->admin_instance, 'display_admin_notices'));
 
         if (is_admin()) {
-            add_filter('post_row_actions', array($this->admin_instance, 'add_post_row_actions'), 10, 2); // 投稿用
-            add_filter('page_row_actions', array($this->admin_instance, 'add_post_row_actions'), 10, 2); // 固定ページ用
-
             $option_name = EDEL_AI_CHATBOT_PLUS_PREFIX . 'settings';
             $options = get_option($option_name, []);
-            $learning_post_types = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'learning_post_types'] ?? ['post', 'page']; // デフォルト
+            $learning_post_types = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'learning_post_types'] ?? ['post', 'page'];
 
+            // ★★★ 行アクションフックを主要な公開投稿タイプに登録 ★★★
+            // get_post_types で公開されている投稿タイプを取得
+            $public_post_types = get_post_types(['public' => true, 'show_ui' => true]); // 管理画面UIがあるもの
+            if (!empty($public_post_types)) {
+                foreach (array_keys($public_post_types) as $post_type) {
+                    // 添付ファイルなどは除外しても良いかも
+                    if ($post_type === 'attachment') continue;
+                    // 各投稿タイプの行アクションフックに登録
+                    add_filter("{$post_type}_row_actions", array($this->admin_instance, 'add_post_row_actions'), 10, 2);
+                }
+            }
+            // ★ 古い固定的な登録は削除 ★
+            // add_filter('post_row_actions', array($this->admin_instance, 'add_post_row_actions'), 10, 2);
+            // add_filter('page_row_actions', array($this->admin_instance, 'add_post_row_actions'), 10, 2);
+
+
+            // ★ カスタム列のフック登録 (これは変更なしのはず) ★
             if (!empty($learning_post_types) && is_array($learning_post_types)) {
                 foreach ($learning_post_types as $post_type) {
-                    // 列を追加するフィルター
                     add_filter('manage_' . $post_type . '_posts_columns', array($this->admin_instance, 'add_ai_status_column'));
-                    // 列の内容を表示するアクション
                     add_action('manage_' . $post_type . '_posts_custom_column', array($this->admin_instance, 'display_ai_status_column'), 10, 2);
                 }
             }
@@ -111,11 +121,10 @@ $edelAiChatbotInstance = new EdelAiChatbotPlus();
 $edelAiChatbotInstance->init();
 
 function edel_ai_chatbot_plus_initialize_updater() {
-    // ユーザー指定のファイルパスを使用
     $puc_file = EDEL_AI_CHATBOT_PLUS_PATH . '/plugin-update-checker/load-v5p5.php';
 
     if (! file_exists($puc_file)) {
-        error_log('Edel AI Chatbot Plus: PUC file not found at ' . $puc_file); // エラーログは残すことを推奨
+        error_log('Edel AI Chatbot Plus: PUC file not found at ' . $puc_file);
         return;
     }
     require_once $puc_file;
