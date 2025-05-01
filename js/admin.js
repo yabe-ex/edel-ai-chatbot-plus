@@ -124,19 +124,19 @@ jQuery(document).ready(function ($) {
         }
         // ★★★ 詳細ログメッセージを表示 (data.log_message があれば) ★★★
         if (data.log_message) {
-            // item_statusに応じて色を変える (オプション)
             let logStyle = '';
             if (data.item_status === 'skipped') {
-                logStyle = 'style="color: #777;"'; // グレー
+                // ← スキップ時のスタイル
+                logStyle = 'style="color: #777;"';
             } else if (data.item_status === 'error') {
-                logStyle = 'style="color: red;"'; // 赤
+                // ← エラー時のスタイル
+                logStyle = 'style="color: red;"';
             }
+            // ★ $progressLog に append する処理 ★
             $progressLog.append('<p ' + logStyle + '>' + escapeHtml(data.log_message) + '</p>');
-            // ログエリアをスクロール
+            // スクロールや古いログ削除 (オプション)
             $progressLog.scrollTop($progressLog[0].scrollHeight);
-            // 古いログを削除 (オプション)
             if ($progressLog.children().length > 50) {
-                // 例: 50件まで保持
                 $progressLog.children().first().remove();
             }
         }

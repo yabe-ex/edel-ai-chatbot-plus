@@ -3,7 +3,10 @@
 namespace Edel\AiChatbotPlus\Admin;
 
 use Edel\AiChatbotPlus\API\EdelAiChatbotOpenAIAPI;
+use Edel\AiChatbotPlus\API\EdelAiChatbotPlusPineconeClient;
 use \WP_Error;
+use \Exception;
+use \Throwable;
 
 class EdelAiChatbotAdmin {
     function admin_menu() {
@@ -31,10 +34,11 @@ class EdelAiChatbotAdmin {
     function admin_enqueue($hook) {
         $version = (defined('EDEL_AI_CHATBOT_PLUS_DEVELOP') && true === EDEL_AI_CHATBOT_PLUS_DEVELOP) ? time() : EDEL_AI_CHATBOT_PLUS_VERSION;
 
+        $main_page_hook = 'toplevel_page_' . EDEL_AI_CHATBOT_PLUS_SLUG;
         $setting_page_hook = EDEL_AI_CHATBOT_PLUS_SLUG . '_page_' . 'edel-ai-chatbot-setting'; // 親スラッグ_page_サブスラッグ
 
         // ★★★ 現在のページが「設定」サブメニューページかどうかを完全一致で判定 ★★★
-        if ($hook === $setting_page_hook) {
+        if ($hook === $main_page_hook || $hook === $setting_page_hook) {
 
             $version = (defined('EDEL_AI_CHATBOT_PLUS_DEVELOP') && true === EDEL_AI_CHATBOT_PLUS_DEVELOP) ? time() : EDEL_AI_CHATBOT_PLUS_VERSION;
 
@@ -62,6 +66,366 @@ class EdelAiChatbotAdmin {
         array_unshift($links, $url);
         return $links;
     }
+
+    /**
+     * 管理画面に「学習済みサイトコンテンツ」の一覧を表示する
+     * （投稿メタデータを参照）
+     */
+    private function display_auto_learned_content_list() {
+        // 設定値を取得
+        $option_name = EDEL_AI_CHATBOT_PLUS_PREFIX . 'settings';
+        $options = get_option($option_name, []);
+        $learning_post_types = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'learning_post_types'] ?? ['post', 'page'];
+        $learning_categories = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'learning_categories'] ?? [];
+        $exclude_ids_str     = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'exclude_ids'] ?? '';
+        $exclude_ids         = !empty($exclude_ids_str) ? array_map('intval', explode(',', $exclude_ids_str)) : [];
+
+        // ページネーション用 現在のページ番号を取得
+        $paged = isset($_GET['paged']) ? absint($_GET['paged']) : 1;
+        // 1ページあたりの表示件数
+        $posts_per_page = 20; // 適宜調整
+
+        // WP_Query の引数を準備
+        $args = [
+            'post_type'      => $learning_post_types,
+            'post_status'    => 'publish',
+            'has_password'   => false,
+            'posts_per_page' => $posts_per_page,
+            'paged'          => $paged, // ページネーション
+            'orderby'        => 'ID',
+            'order'          => 'DESC', // 新しいものから表示する場合
+            'meta_query'     => array(
+                'relation' => 'AND', // 複数の条件を組み合わせる場合は 'AND' または 'OR'
+                array(
+                    'key'     => '_edel_ai_vector_count', // このメタキーが存在し、
+                    'compare' => 'EXISTS',
+                ),
+                array(
+                    'key'     => '_edel_ai_vector_count', // かつ、その値が
+                    'value'   => 0,                      // 0 より大きい
+                    'compare' => '>',
+                    'type'    => 'NUMERIC',              // 数値として比較
+                ),
+            )
+        ];
+        if (!empty($learning_categories)) {
+            $args['category__in'] = $learning_categories;
+        }
+        if (!empty($exclude_ids)) {
+            $args['post__not_in'] = $exclude_ids;
+        }
+
+        // WP_Query を実行
+        $query = new \WP_Query($args); // use \WP_Query; が必要か確認
+
+        if (!$query->have_posts()) {
+            echo '<p>自動学習で登録されたデータはありません。（または指定条件に合う投稿がありません）</p>';
+            return; // 投稿がなければここで終了
+        }
+?>
+        <p>サイトの投稿や固定ページから自動的に学習されたデータの一覧です。（学習状態はWordPressのメタデータに基づきます）</p>
+        <table class="wp-list-table widefat striped fixed">
+            <thead>
+                <tr>
+                    <th scope="col" style="width: 40%;">タイトル</th>
+                    <th scope="col" style="width: 10%;">タイプ</th>
+                    <th scope="col" style="width: 10%;">ベクトル数</th>
+                    <th scope="col" style="width: 20%;">AI学習状態 (最終処理日時)</th>
+                    <th scope="col" style="width: 20%;">操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php
+                while ($query->have_posts()) : $query->the_post();
+                    global $post; // ループ内で $post 変数を使えるように
+                    error_log("--- Checking post ID: {$post->ID} for list ---");
+                    // メタデータを取得
+                    $last_learned_gmt = get_post_meta($post->ID, '_edel_ai_last_learned_gmt', true);
+                    $vector_count     = get_post_meta($post->ID, '_edel_ai_vector_count', true);
+                    $vector_count     = !empty($vector_count) ? (int) $vector_count : 0;
+                    $processed_gmt    = get_post_meta($post->ID, '_edel_ai_processed_gmt', true);
+                    $current_modified_gmt = $post->post_modified_gmt;
+
+                    // ステータス判定
+                    $status_text = '';
+                    $status_color = '#777';
+                    $display_time = '';
+
+                    if ($vector_count === 0) {
+                        $status_text = '未学習';
+                    } else {
+                        if (!empty($processed_gmt) && $processed_gmt !== '0000-00-00 00:00:00') {
+                            $timestamp = strtotime($processed_gmt . ' GMT');
+                            if ($timestamp !== false) {
+                                $timezone = wp_timezone();
+                                $format = get_option('date_format') . ' ' . get_option('time_format');
+                                $display_time = wp_date($format, $timestamp, $timezone);
+                            } else {
+                                $display_time = '(日時エラー)';
+                            }
+                        }
+                        if (empty($last_learned_gmt) || strtotime($current_modified_gmt) > strtotime($last_learned_gmt)) {
+                            $status_text = '要再学習';
+                            $status_color = '#ffa500';
+                        } else {
+                            $status_text = '学習済み';
+                            $status_color = '#228b22';
+                        }
+                        if (!empty($display_time)) {
+                            $status_text .= ' (' . esc_html($display_time) . ')';
+                        }
+                    }
+                ?>
+                    <tr>
+                        <td>
+                            <a href="<?php echo esc_url(get_edit_post_link($post->ID)); ?>" target="_blank">
+                                <?php echo esc_html(get_the_title($post->ID)); ?>
+                            </a>
+                            (ID: <?php echo esc_html($post->ID); ?>)
+                        </td>
+                        <td><?php echo esc_html(get_post_type_object($post->post_type)->label ?? $post->post_type); ?></td>
+                        <td style="text-align: center;"><?php echo esc_html($vector_count); ?></td>
+                        <td><span style="color: <?php echo esc_attr($status_color); ?>;"><?php echo esc_html($status_text); ?></span></td>
+                        <td>
+                            <?php // 削除ボタン用フォーム
+                            ?>
+                            <form method="POST" style="display: inline;">
+                                <?php wp_nonce_field(EDEL_AI_CHATBOT_PLUS_PREFIX . 'delete_auto_entry_nonce'); ?>
+                                <input type="hidden" name="source_post_id" value="<?php echo esc_attr($post->ID); ?>">
+                                <input type="submit" name="delete_auto_entry" value="学習データ削除" class="button button-link-delete" onclick="return confirm('投稿「<?php echo esc_js(get_the_title($post->ID)); ?>」の学習データを削除しますか？\n関連するベクトルデータがPineconeから削除されます。');">
+                            </form>
+                        </td>
+                    </tr>
+                <?php
+                endwhile;
+                wp_reset_postdata(); // クエリをリセット
+                ?>
+            </tbody>
+        </table>
+
+        <?php // ページネーションリンクの表示
+        $big = 999999999; // need an unlikely integer
+        $pagination_args = array(
+            'base' => str_replace($big, '%#%', esc_url(get_pagenum_link($big))),
+            'format' => '?paged=%#%',
+            'current' => max(1, $paged),
+            'total' => $query->max_num_pages, // WP_Queryオブジェクトから総ページ数を取得
+            'prev_text' => __('&laquo; 前へ'),
+            'next_text' => __('次へ &raquo;'),
+        );
+        $paginate_links = paginate_links($pagination_args);
+        if ($paginate_links) {
+            echo '<div class="tablenav"><div class="tablenav-pages" style="margin: 1em 0;">' . $paginate_links . '</div></div>';
+        }
+        ?>
+    <?php
+    } // end display_auto_learned_content_list()
+
+    /**
+     * 指定された投稿タイプの一覧画面に「AI学習状態」列を追加する
+     *
+     * @param array $columns 既存の列定義配列
+     * @return array 列を追加した配列
+     */
+    public function add_ai_status_column(array $columns): array {
+        // 例えば 'date' (日付) 列の前に新しい列を追加
+        $new_columns = [];
+        foreach ($columns as $key => $title) {
+            if ($key === 'date') {
+                $new_columns[EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_status'] = 'AI学習状態'; // 新しい列
+            }
+            $new_columns[$key] = $title;
+        }
+        // もし date 列がなかった場合のために最後に追加
+        if (!isset($new_columns[EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_status'])) {
+            $new_columns[EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_status'] = 'AI学習状態';
+        }
+        return $new_columns;
+    }
+
+    /**
+     * 「AI学習状態」列の内容を表示する
+     *
+     * @param string $column_name 現在処理中の列名
+     * @param int $post_id 現在処理中の投稿ID
+     */
+    public function display_ai_status_column(string $column_name, int $post_id) {
+        // 対象のカラムでなければ何もしない
+        if ($column_name !== EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_status') {
+            return;
+        }
+
+        error_log("--- display_ai_status_column called for post ID: {$post_id} ---");
+
+
+        // 保存されているメタデータを取得
+        // _edel_ai_last_learned_gmt: 差分比較用の、学習した時点での投稿更新日時(GMT)
+        $last_learned_gmt = get_post_meta($post_id, '_edel_ai_last_learned_gmt', true);
+        $vector_count     = get_post_meta($post_id, '_edel_ai_vector_count', true);
+        $vector_count     = !empty($vector_count) ? (int) $vector_count : 0;
+        $processed_gmt    = get_post_meta($post_id, '_edel_ai_processed_gmt', true);
+
+        error_log("    _edel_ai_last_learned_gmt: " . print_r($last_learned_gmt, true));
+        error_log("    _edel_ai_vector_count: " . print_r($vector_count, true));
+        error_log("    _edel_ai_processed_gmt: " . print_r($processed_gmt, true));
+
+
+        // 現在の投稿データを取得
+        $post = get_post($post_id);
+        if (!$post) {
+            echo '---'; // 投稿が見つからない場合
+            return;
+        }
+        $current_modified_gmt = $post->post_modified_gmt; // 現在の投稿更新日時(GMT)
+
+        // ステータスと表示日時を決定
+        $status_text = '';
+        $status_color = '#777'; // デフォルト色（グレー）
+        $display_time = '';    // 表示用日時文字列
+
+        if ($vector_count === 0) {
+            $status_text = '未学習';
+        } else {
+            // ★★★ wp_date() を使って処理実行日時を表示用にフォーマット ★★★
+            if (!empty($processed_gmt) && $processed_gmt !== '0000-00-00 00:00:00') {
+                // 1. DBから取得したGMT時刻文字列をUnixタイムスタンプに変換
+                //    ' GMT' を付けてGMTであることを明示
+                $timestamp = strtotime($processed_gmt . ' GMT');
+
+                if ($timestamp !== false) {
+                    // 2. WordPressサイト設定のタイムゾーンを取得
+                    $timezone = wp_timezone(); // DateTimeZone オブジェクトを返す
+
+                    // 3. サイト設定の日付・時刻フォーマットを取得
+                    $format = get_option('date_format') . ' ' . get_option('time_format');
+
+                    // 4. wp_date() でタイムゾーン変換とフォーマットを行う
+                    //    第1引数: フォーマット
+                    //    第2引数: Unixタイムスタンプ (GMT/UTC)
+                    //    第3引数: 変換先のタイムゾーンオブジェクト
+                    $display_time = wp_date($format, $timestamp, $timezone);
+                } else {
+                    // strtotimeが失敗した場合
+                    $display_time = '(日時変換エラー)';
+                    error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' strtotime failed for processed_gmt: ' . $processed_gmt);
+                }
+            }
+
+            // 状態判定 (比較には $last_learned_gmt を使う)
+            if (empty($last_learned_gmt) || strtotime($current_modified_gmt) > strtotime($last_learned_gmt)) {
+                $status_text = '要再学習';
+                $status_color = '#ffa500'; // オレンジ色
+            } else {
+                $status_text = '学習済み';
+                $status_color = '#228b22'; // 緑色
+            }
+
+            // ステータス文字列に日時を追加（日時があれば）
+            if (!empty($display_time)) {
+                $status_text .= ' (' . esc_html($display_time) . ')';
+            }
+        } // end if $vector_count
+
+        // 最終的なHTMLを出力
+        echo '<span style="color: ' . esc_attr($status_color) . ';">' . esc_html($status_text) . '</span>';
+    } // end display_ai_status_column()
+
+    /**
+     * [Admin Action Handler] 単一投稿の学習ジョブを WP-Cron でスケジュールする
+     */
+    public function handle_learn_single_post_action() {
+        // 1. Nonce 検証
+        $nonce_action = EDEL_AI_CHATBOT_PLUS_PREFIX . 'learn_single_post_nonce';
+        if (!isset($_GET['_wpnonce']) || !wp_verify_nonce($_GET['_wpnonce'], $nonce_action)) {
+            wp_die('不正なリクエストです。(Nonce)');
+        }
+
+        // 2. 投稿IDを取得・検証
+        if (!isset($_GET['post_id'])) {
+            wp_die('投稿IDが指定されていません。');
+        }
+        $post_id = absint($_GET['post_id']);
+        if ($post_id === 0 || !get_post($post_id)) {
+            wp_die('無効な投稿IDです。');
+        }
+
+        // 3. ★★★ WP-Cron で単発イベントをスケジュール ★★★
+        $hook_name = EDEL_AI_CHATBOT_PLUS_PREFIX . 'process_post_learning'; // ★ 実行するフック名
+        $args_to_schedule = [json_encode(['post_id' => $post_id])];
+        $timestamp = time() + 1;
+
+        // 同じ引数で既にスケジュールされていないかチェック (オプションだが推奨)
+        // wp_next_scheduled は同じフックで最初の予定時刻を返す
+        $next_schedule = wp_next_scheduled($hook_name, $args_to_schedule);
+        if ($next_schedule === false) { // falseならスケジュールされていない
+            // 単発イベントをスケジュール
+            // $schedule_result = wp_schedule_single_event($timestamp, $hook_name, $args_to_schedule);
+            $schedule_result = wp_schedule_single_event($timestamp, $hook_name, $args_to_schedule);
+
+            if ($schedule_result !== false) {
+                $message_text = sprintf('投稿ID %d の学習処理をスケジュールしました（約1秒後に実行予定）。', $post_id);
+                $message_type = 'success';
+            } else {
+                $message_text = sprintf('投稿ID %d の学習処理のスケジュールに失敗しました。', $post_id);
+                $message_type = 'error';
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Failed to schedule WP-Cron event for post ID: ' . $post_id);
+            }
+        } else {
+            // 既にスケジュールされている場合
+            $message_text = sprintf('投稿ID %d の学習処理は既にスケジュールされています（実行待ち）。', $post_id);
+            $message_type = 'info';
+        }
+
+        // 4. リダイレクト処理と通知メッセージの保存 (変更なし)
+        $transient_key = EDEL_AI_CHATBOT_PLUS_PREFIX . 'admin_notice_' . get_current_user_id();
+        set_transient($transient_key, ['type' => $message_type, 'message' => $message_text], 30);
+        $redirect_url = wp_get_referer() ?: admin_url('edit.php?post_type=' . get_post_type($post_id));
+        wp_safe_redirect($redirect_url);
+        exit;
+    } // end handle_learn_single_post_action()
+
+    /**
+     * (オプション) 管理画面に一時的な通知メッセージを表示する
+     */
+    public function display_admin_notices() {
+        $transient_key = EDEL_AI_CHATBOT_PLUS_PREFIX . 'admin_notice_' . get_current_user_id();
+        $notice = get_transient($transient_key);
+
+        if ($notice && isset($notice['type']) && isset($notice['message'])) {
+            // メッセージがあれば表示
+            $class = 'notice notice-' . $notice['type'] . ' is-dismissible';
+            printf('<div class="%1$s"><p>%2$s</p></div>', esc_attr($class), esc_html($notice['message']));
+            // 一度表示したら削除
+            delete_transient($transient_key);
+        }
+    } // end display_admin_notices()
+
+    public function add_post_row_actions(array $actions, \WP_Post $post): array {
+        // ★★★ ここの設定値読み込みと条件判定が怪しい ★★★
+        $option_name = EDEL_AI_CHATBOT_PLUS_PREFIX . 'settings';
+        $options = get_option($option_name, []);
+        // ↓ デフォルト値が ['post', 'page'] になっているか？
+        $learning_post_types = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'learning_post_types'] ?? ['post', 'page'];
+
+        // ↓ この if 文の条件が false になっている可能性が高い
+        if (in_array($post->post_type, $learning_post_types) && $post->post_status === 'publish' && empty($post->post_password)) {
+            $nonce_action = EDEL_AI_CHATBOT_PLUS_PREFIX . 'learn_single_post_nonce';
+            $nonce = wp_create_nonce($nonce_action);
+            $learn_url = admin_url('admin.php?action=' . EDEL_AI_CHATBOT_PLUS_PREFIX . 'learn_post&post_id=' . $post->ID . '&_wpnonce=' . $nonce);
+            $actions['edel_ai_learn'] = '<a href="' . esc_url($learn_url) . '" aria-label="' . esc_attr(sprintf(__('%s をAIに学習させる', 'edel-ai-chatbot-plus'), $post->post_title)) . '">AI学習</a>';
+        } else {
+            // ★ (デバッグ用) 条件に一致しなかった理由をログに出力 ★
+            error_log(
+                'Edel AI Chatbot Plus: Skipping action link for Post ID: ' . $post->ID . ' - Reason: ' .
+                    'Type Match? ' . (in_array($post->post_type, $learning_post_types) ? 'Yes' : 'No (' . $post->post_type . ')') .
+                    ', Is Published? ' . ($post->post_status === 'publish' ? 'Yes' : 'No (' . $post->post_status . ')') .
+                    ', No Password? ' . (empty($post->post_password) ? 'Yes' : 'No') .
+                    '. Learning types setting: [' . implode(',', $learning_post_types) . ']'
+            );
+        }
+        return $actions;
+    }
+
 
     public function handle_batch_learning_ajax() {
         // 1. Nonce検証 (JSから送られてくる nonce を検証)
@@ -149,8 +513,7 @@ class EdelAiChatbotAdmin {
                 } else {
                     // ★ 処理を実行 (process_single_post_learning メソッドを呼び出す) ★
                     $processed_id = $items_to_process[0]; // 今回は1件だけ
-                    $result = $this->process_single_post_learning(['post_id' => $processed_id]);
-
+                    $result = $this->process_single_post_learning_ajax(['post_id' => $processed_id]);
                     $next_offset = $offset + $limit;
                     $is_complete = ($next_offset >= $total_items);
                     if ($is_complete) {
@@ -160,9 +523,10 @@ class EdelAiChatbotAdmin {
                     // フロントエンドに応答を返す
                     wp_send_json_success([
                         'status'          => $is_complete ? 'complete' : 'processing',
-                        'offset'          => $next_offset, // 次のリクエストで使うオフセット
-                        'processed_count' => count($items_to_process), // 今回処理した件数
-                        'log_message'     => '投稿ID ' . $processed_id . ' の処理を実行しました。' . ($is_complete ? ' 全工程完了。' : '')
+                        'offset'          => $next_offset,
+                        'processed_count' => 1,
+                        'item_status'     => $result['status'] ?? 'unknown',
+                        'log_message'     => '投稿ID ' . $processed_id . ': ' . ($result['message'] ?? '不明な結果')
                     ]);
                 }
             } else {
@@ -183,15 +547,200 @@ class EdelAiChatbotAdmin {
     } // end handle_batch_learning_ajax
 
     /**
+     * ★ WP-Cron用コールバックラッパー ★
+     * edel_ai_chatbot_plus_process_post_learning フックから呼び出される
+     *
+     * @param string $json_args スケジュール時に渡されたJSON文字列 '{"post_id":ID}'
+     * @return void
+     */
+    public function process_single_post_learning_cron(string $json_args) { // 戻り値 void
+        error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' WP-Cron job started with JSON args: ' . $json_args);
+        $args = json_decode($json_args, true);
+
+        if (!$args || !isset($args['post_id']) || !is_numeric($args['post_id'])) {
+            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Invalid JSON args received via WP-Cron: ' . $json_args);
+            return; // エラーログだけ残して終了
+        }
+        $post_id = (int) $args['post_id'];
+
+        // 共通処理メソッドを呼び出す (戻り値はここでは使わない)
+        $result = $this->_process_post_content($post_id);
+
+        // (オプション) 処理結果 $result を使って何かログを追加しても良い
+        error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' WP-Cron job finished for post ID: ' . $post_id . ' with status: ' . ($result['status'] ?? 'unknown'));
+    }
+
+
+    /**
+     * ★ Ajaxループ用コールバックラッパー ★
+     * handle_batch_learning_ajax から呼び出される想定
+     *
+     * @param array $args ['post_id' => ID]
+     * @return array 処理結果
+     */
+    public function process_single_post_learning_ajax(array $args): array {
+        if (!isset($args['post_id']) || !is_numeric($args['post_id'])) {
+            return ['status' => 'error', 'message' => 'Invalid arguments for AJAX processing'];
+        }
+        $post_id = (int) $args['post_id'];
+        // 共通処理メソッドを呼び出す
+        return $this->_process_post_content($post_id);
+    }
+
+    /**
+     * ★ 新規追加：個別の投稿処理を行うコアロジック (private or protected) ★
+     *
+     * @param int $post_id 処理対象の投稿ID
+     * @return array 処理結果 ['status' => 'processed'|'skipped'|'error', 'message' => '詳細']
+     */
+    private function _process_post_content(int $post_id): array {
+        $status = 'error'; // デフォルトステータス
+        $message = '不明なエラーが発生しました。'; // デフォルトメッセージ
+
+        try {
+            // --- 1. 必要な設定値を取得 ---
+            $option_name = EDEL_AI_CHATBOT_PLUS_PREFIX . 'settings';
+            $options = get_option($option_name, []);
+            $openai_api_key       = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'] ?? '';
+            $pinecone_api_key     = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_api_key'] ?? '';
+            $pinecone_environment = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_environment'] ?? '';
+            $pinecone_index_name  = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_index_name'] ?? '';
+            $pinecone_host        = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_host'] ?? '';
+
+            if (empty($openai_api_key) || empty($pinecone_api_key) || empty($pinecone_environment) || empty($pinecone_index_name) || empty($pinecone_host)) {
+                throw new \Exception('OpenAI APIキーまたはPinecone設定が不足しています。設定ページを確認してください。');
+            }
+
+            // --- 2. APIクライアント準備 ---
+            // (use宣言がクラスファイル先頭にある想定)
+            $openai_api = new \Edel\AiChatbotPlus\API\EdelAiChatbotOpenAIAPI($openai_api_key);
+            $pinecone_client = new \Edel\AiChatbotPlus\API\EdelAiChatbotPlusPineconeClient(
+                $pinecone_api_key,
+                $pinecone_environment,
+                $pinecone_index_name,
+                $pinecone_host
+            );
+
+            // --- 3. 投稿オブジェクト取得と現在の更新日時取得 ---
+            $post = get_post($post_id);
+            if (!$post || $post->post_status !== 'publish' || !empty($post->post_password)) {
+                return ['status' => 'skipped', 'message' => '対象外 (非公開/パスワード保護など)'];
+            }
+            $current_modified_gmt = $post->post_modified_gmt;
+
+            // --- 4. Pineconeから前回の更新日時を取得 ---
+            $db_modified_gmt = null;
+            $filter = ['source_post_id' => ['$eq' => $post_id]];
+            $existing_vector_info = $pinecone_client->query(array_fill(0, 1536, 0.0), 1, $filter, null, true, false);
+
+            if (is_wp_error($existing_vector_info)) {
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Failed to query Pinecone for existing modified time for post ID ' . $post_id . ': ' . $existing_vector_info->get_error_message());
+                // エラーでも処理を続行し、新規として扱う（あるいはエラーを返す）
+            } elseif (isset($existing_vector_info['matches'][0]['metadata']['modified_gmt'])) {
+                $db_modified_gmt = $existing_vector_info['matches'][0]['metadata']['modified_gmt'];
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Found existing modified_gmt in Pinecone: ' . $db_modified_gmt . ' for post ID ' . $post_id);
+            } else {
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' No existing data found in Pinecone for post ID: ' . $post_id);
+            }
+
+            // --- 5. 更新日時の比較と処理実行 ---
+            if ($db_modified_gmt === null || strtotime($current_modified_gmt) > strtotime($db_modified_gmt)) {
+
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Processing post ID: ' . $post_id . ' (Needs update or first time)');
+
+                // ★ 古いデータの削除 ★
+                // PineconeのUpsertはIDが同じなら上書きするので、明示的な削除は必須ではない場合が多い。
+                // ただし、チャンク数が変わった場合などに古いチャンクが残るのを防ぐには削除が確実。
+                // 実装が複雑になるため、ここでは一旦コメントアウトし、Upsertによる上書きを期待。
+                // 必要ならPineconeClientに deleteVectorsByFilter(['source_post_id' => ['$eq' => $post_id]]) のようなメソッドを実装して呼び出す。
+                /*
+                if ($db_modified_gmt !== null) {
+                    error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Deleting old vectors from Pinecone for post ID: ' . $post_id);
+                    // $delete_filter = ['source_post_id' => ['$eq' => $post_id]];
+                    // $delete_result = $pinecone_client->deleteByFilter($delete_filter); // 要実装
+                    // if (is_wp_error($delete_result)) { error_log(...); }
+                }
+                */
+
+                // コンテンツ取得・前処理
+                $content = apply_filters('the_content', $post->post_content);
+                $clean_content = trim(wp_strip_all_tags(strip_shortcodes($content)));
+                if (empty($clean_content)) {
+                    return ['status' => 'skipped', 'message' => 'コンテンツ空'];
+                }
+
+                // チャンキング (chunk_text_fixed_length は同クラスの protected/public メソッドと仮定)
+                $chunk_size = 500;
+                $chunk_overlap = 50;
+                $text_chunks = $this->chunk_text_fixed_length($clean_content, $chunk_size, $chunk_overlap);
+                if (empty($text_chunks)) {
+                    return ['status' => 'skipped', 'message' => 'チャンク生成なし'];
+                }
+
+                // ループしてベクトル化＆Pinecone保存
+                $saved_chunks = 0;
+                $errors = 0;
+                foreach ($text_chunks as $chunk_index => $chunk) {
+                    try {
+                        $vector = $openai_api->get_embedding($chunk);
+                        if (is_wp_error($vector)) {
+                            throw new \Exception('ベクトル化失敗: ' . $vector->get_error_message());
+                        }
+
+                        $vector_id = $post_id . '-' . $chunk_index; // ID生成
+                        $metadata = [
+                            'source_type'      => $post->post_type,
+                            'source_post_id'   => $post_id,
+                            'source_title'     => $post->post_title,
+                            'text_preview'     => mb_substr(preg_replace('/\s+/', ' ', $chunk), 0, 100),
+                            'modified_gmt'     => $current_modified_gmt // ★ 現在の更新日時
+                        ];
+
+                        $upsert_result = $pinecone_client->upsert($vector_id, $vector, $metadata);
+                        if (is_wp_error($upsert_result)) {
+                            throw new \Exception('Pinecone保存失敗: ' . $upsert_result->get_error_message());
+                        }
+                        $saved_chunks++;
+                        // usleep(200000); // レートリミット対策が必要なら入れる
+                    } catch (\Exception $e_chunk) {
+                        error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Chunk processing error for post ID ' . $post_id . ' - chunk ' . $chunk_index . ': ' . $e_chunk->getMessage());
+                        $errors++;
+                    }
+                } // end foreach chunk
+
+                $status = ($errors === 0) ? 'processed' : 'processed_with_errors';
+                $message = sprintf('%d チャンク保存完了', $saved_chunks) . ($errors > 0 ? sprintf(' (%d エラー)', $errors) : '');
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Finished processing updated post ID: ' . $post_id . '. ' . $message);
+                if ($saved_chunks > 0 || ($saved_chunks === 0 && $errors === 0 && !empty($text_chunks))) { // チャンクがあってエラーなく0件保存、もありうる？ -> やはり saved_chunks > 0 のみが安全か
+                    // if ($status === 'processed' || $status === 'processed_with_errors') { // またはステータスで判断
+                    update_post_meta($post_id, '_edel_ai_last_learned_gmt', $current_modified_gmt);
+                    update_post_meta($post_id, '_edel_ai_vector_count', $saved_chunks); // 保存したチャンク数を記録
+                    update_post_meta($post_id, '_edel_ai_processed_gmt', current_time('mysql', 1)); // 現在のGMT時刻を保存
+                    error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Post meta updated for post ID: ' . $post_id);
+                }
+                return ['status' => $status, 'message' => $message];
+            } else {
+                // --- 更新不要 ---
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Skipping post ID: ' . $post_id . ' (Not modified)');
+                return ['status' => 'skipped', 'message' => '更新なし (スキップ)'];
+            }
+        } catch (\Throwable $t) { // 広範なエラーを捕捉
+            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Error in _process_post_content for post ID ' . $post_id . ': ' . $t->getMessage() . ' in ' . $t->getFile() . ' on line ' . $t->getLine());
+            return ['status' => 'error', 'message' => 'エラー: ' . $t->getMessage()];
+        }
+    } // end _process_post_content()
+
+    /**
      * [Action Scheduler Callback / Batch Process Unit] 指定された投稿IDの学習処理を実行する
      * (最終更新日時をチェックし、更新がある場合のみ処理)
      *
      * @param array $args Action Schedulerから渡される引数 (['post_id' => ID])
      */
-    public function process_single_post_learning(array $args) { // ★ アクセス権限を public に変更推奨
+    public function process_single_post_learning(array $args) {
+        // ★ 配列から post_id を取り出す ★
         if (!isset($args['post_id']) || !is_numeric($args['post_id'])) {
-            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Invalid arguments passed to process_single_post_learning.');
-            return; // 引数が不正なら終了
+            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Invalid arguments passed to process_single_post_learning: ' . print_r($args, true));
+            return ['status' => 'error', 'message' => 'Invalid arguments']; // 配列で返すのが望ましい
         }
         $post_id = (int) $args['post_id'];
 
@@ -212,21 +761,40 @@ class EdelAiChatbotAdmin {
         }
 
         try {
-            // 1. 投稿オブジェクト取得と最終更新日時取得
+            $openai_api = new \Edel\AiChatbotPlus\API\EdelAiChatbotOpenAIAPI($api_key);
+            $pinecone_client = new \Edel\AiChatbotPlus\API\EdelAiChatbotPlusPineconeClient(
+                $pinecone_api_key,
+                $pinecone_environment,
+                $pinecone_index_name,
+                $pinecone_host
+            );
+
+            // 1. 投稿オブジェクト取得と現在の更新日時取得
             $post = get_post($post_id);
             if (!$post || $post->post_status !== 'publish' || !empty($post->post_password)) {
-                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Info: Skipping post ID: ' . $post_id . ' (Not found, not published, or password protected).');
-                return; // 対象外ならスキップ
+                return ['status' => 'skipped', 'message' => '対象外'];
             }
-            // WordPressの投稿更新日時 (GMT) を取得
             $current_modified_gmt = $post->post_modified_gmt;
-            // $current_modified = $post->post_modified; // サイト設定のタイムゾーン日時
 
-            // 2. DBに保存されている最終更新日時を取得
-            $db_modified_gmt = $wpdb->get_var($wpdb->prepare(
-                "SELECT source_post_modified FROM {$vector_table_name} WHERE source_post_id = %d ORDER BY id DESC LIMIT 1", // LIMIT 1 で最新のものを取得
-                $post_id
-            ));
+            // 2. Pineconeから前回の更新日時を取得 ★★★
+            $db_modified_gmt = null; // 初期化
+            $filter = ['source_post_id' => ['$eq' => $post_id]]; // post_id でフィルタ
+            // topK=1, includeMetadata=true でクエリ実行 (ベクトル値は不要)
+            $existing_vector_info = $pinecone_client->query(array_fill(0, 1536, 0.0), 1, $filter, null, true, false);
+
+            if (is_wp_error($existing_vector_info)) {
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Failed to query Pinecone for existing modified time for post ID ' . $post_id . ': ' . $existing_vector_info->get_error_message());
+                // エラーの場合はスキップするか、処理を続けるか（今回はスキップしてエラーを返す方が安全か）
+                // return ['status' => 'error', 'message' => '既存データ確認エラー'];
+                // または、エラーでも処理を続行し、常に新規として扱うか (↓のif条件で $db_modified_gmt は null のままになる)
+            } elseif (isset($existing_vector_info['matches'][0]['metadata']['modified_gmt'])) {
+                // データが見つかり、メタデータに更新日時があれば取得
+                $db_modified_gmt = $existing_vector_info['matches'][0]['metadata']['modified_gmt'];
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Found existing modified_gmt in Pinecone: ' . $db_modified_gmt . ' for post ID ' . $post_id);
+            } else {
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' No existing data found in Pinecone for post ID: ' . $post_id);
+                // データがない場合は $db_modified_gmt は null のまま
+            }
 
             // 3. 更新日時の比較
             // $db_modified_gmt が null (DBにない) か、現在の更新日時の方が新しい場合に処理実行
@@ -275,7 +843,7 @@ class EdelAiChatbotAdmin {
                 // 8. チャンクループ: ベクトル化とDB保存
                 $post_chunks_saved = 0;
                 $post_errors = 0;
-                foreach ($text_chunks as $chunk) {
+                foreach ($text_chunks as $chunk_index => $chunk) {
                     try {
                         $vector = $openai_api->get_embedding($chunk);
                         if (is_wp_error($vector)) {
@@ -287,10 +855,11 @@ class EdelAiChatbotAdmin {
                         $vector_id = $post_id . '-' . $chunk_index;
                         // 保存するメタデータ
                         $metadata = [
-                            'source_post_id' => $post_id,
-                            'text_preview'   => mb_substr(preg_replace('/\s+/', ' ', $chunk), 0, 100), // チャンク冒頭100文字(改行等除去)
-                            'modified_gmt'   => $current_modified_gmt, // 更新日時
-                            // 必要なら投稿タイトルなども追加: 'title' => $post->post_title
+                            'source_type'      => $post->post_type,   // ★ 投稿タイプ (post, page など)
+                            'source_post_id'   => $post_id,           // 投稿ID
+                            'source_title'     => $post->post_title,    // ★ 投稿タイトル
+                            'text_preview'     => mb_substr(preg_replace('/\s+/', ' ', $chunk), 0, 100),
+                            'modified_gmt'     => $current_modified_gmt // 更新日時
                         ];
 
                         // Pineconeクライアントの upsert メソッド呼び出し
@@ -379,128 +948,481 @@ class EdelAiChatbotAdmin {
      * メインページ（学習データ登録）を表示するメソッド
      */
     function show_main_page() {
-        // --- データ登録処理 ---
-        global $wpdb;
-        $table_name = $wpdb->prefix . EDEL_AI_CHATBOT_PLUS_PREFIX . 'vectors';
-        $nonce_action_learn = EDEL_AI_CHATBOT_PLUS_PREFIX . 'learn_data_nonce';
-        $submit_name_learn  = EDEL_AI_CHATBOT_PLUS_PREFIX . 'submit_learn_data';
+        global $wpdb; // delete処理で $wpdb を使う可能性があるので念のため残す
+        $option_name = EDEL_AI_CHATBOT_PLUS_PREFIX . 'settings';
+        $options = get_option($option_name, []); // 設定を最初に読み込む
 
-        // フォームが送信され、Nonceが有効かチェック
-        if (isset($_POST[$submit_name_learn]) && check_admin_referer($nonce_action_learn)) {
+        // Pinecone接続情報を取得
+        $pinecone_api_key     = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_api_key'] ?? '';
+        $pinecone_environment = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_environment'] ?? '';
+        $pinecone_index_name  = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_index_name'] ?? '';
+        $pinecone_host        = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_host'] ?? '';
 
-            $option_name = EDEL_AI_CHATBOT_PLUS_PREFIX . 'settings';
-            $options = get_option($option_name, []);
-            $api_key = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'] ?? '';
+        // Pineconeクライアントの準備 (エラーチェックも含む)
+        $pinecone_client = null;
+        $pinecone_error_message = ''; // Pinecone接続エラー用
+        if (!empty($pinecone_api_key) && !empty($pinecone_environment) && !empty($pinecone_index_name) && !empty($pinecone_host)) {
+            try {
+                // クラスファイル読み込みとインスタンス化 (use宣言をクラス先頭で行う推奨)
+                // require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-pinecone-client.php'; // 既に読み込まれてるはず？
+                $pinecone_client = new \Edel\AiChatbotPlus\API\EdelAiChatbotPlusPineconeClient(
+                    $pinecone_api_key,
+                    $pinecone_environment,
+                    $pinecone_index_name,
+                    $pinecone_host
+                );
+            } catch (\Throwable $th) { // 修正: InvalidArgumentException ではなく Throwable
+                $pinecone_error_message = 'Pineconeクライアントの初期化に失敗しました: ' . $th->getMessage();
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . $pinecone_error_message); // エラーログにも記録
+            }
+        } else {
+            $pinecone_error_message = 'Pineconeの設定が完了していません。学習データの登録・管理機能は利用できません。';
+        }
 
-            if (!empty($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'learning_text'])) {
-                $raw_text = wp_unslash($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'learning_text']);
-                $clean_text = strip_tags($raw_text);
-                $clean_text = trim($clean_text);
+        // Pineconeエラーがあればメッセージ表示
+        if (!empty($pinecone_error_message)) {
+            echo '<div class="notice notice-error"><p>' . esc_html($pinecone_error_message) . '</p></div>';
+        }
 
-                if (!empty($clean_text)) {
-                    // 2. テキストチャンキング
-                    $chunk_size = 500;
-                    $chunk_overlap = 50;
-                    $text_chunks = $this->chunk_text_fixed_length($clean_text, $chunk_size, $chunk_overlap);
+        // ★★★ 手動学習データの削除処理 (ここに追加) ★★★
+        $nonce_action_delete_manual = EDEL_AI_CHATBOT_PLUS_PREFIX . 'delete_manual_entry_nonce';
+        // 削除ボタンが押され、かつ Pinecone クライアントが有効な場合に処理
+        if ($pinecone_client && isset($_POST['delete_manual_entry']) && isset($_POST['entry_title']) && check_admin_referer($nonce_action_delete_manual)) {
+            $title_to_delete = sanitize_text_field(wp_unslash($_POST['entry_title']));
 
-                    if (!empty($text_chunks)) {
-                        echo '<div class="notice notice-info is-dismissible"><p>' . count($text_chunks) . ' 個のテキストチャンクに分割されました。ベクトル化とDB保存を開始します...</p></div>';
+            echo '<div id="message" class="notice notice-info is-dismissible"><p>手動学習データ「' . esc_html($title_to_delete) . '」の削除処理を開始します...</p></div>';
+            if (function_exists('ob_flush')) {
+                @ob_flush();
+            }
+            flush();
 
-                        // ★OpenAI API連携クラスを読み込み、インスタンス化★
-                        require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-openai-api.php'; // ファイルパスを確認
-                        $openai_api = new EdelAiChatbotOpenAIAPI($api_key);
+            try {
+                // 削除対象のベクトルIDリストを取得 (Pineconeにタイトルで問い合わせる)
+                // listManualEntries はタイトル毎にIDをまとめて返すので、直接は使えない
+                // query を直接使うか、タイトルでIDリストを返すメソッドを Client に追加する必要がある
+                // ここでは query を使う例 (要 PineconeClient 側修正 or ここで直接 wp_remote_post)
 
-                        $success_count = 0;
-                        $error_count = 0;
-                        $db_error_count = 0;
+                // ダミーベクトルを用意
+                $dummy_vector = array_fill(0, 1536, 0.0); // 次元数は合わせる
+                // フィルタ条件
+                $filter = [
+                    'source_type' => ['$eq' => 'manual'],
+                    'source_title' => ['$eq' => $title_to_delete]
+                ];
+                // query メソッド呼び出し (IDのみ取得できれば良い)
+                $query_result = $pinecone_client->query($dummy_vector, 1000, $filter, null, false, false); // メタデータも値も不要
 
-                        // ★ループしてベクトル化とDB保存★
-                        foreach ($text_chunks as $index => $chunk) {
-                            // 3. ベクトル化
-                            $embedding_result = $openai_api->get_embedding($chunk);
+                if (is_wp_error($query_result)) {
+                    throw new \Exception('削除対象IDの取得に失敗: ' . $query_result->get_error_message());
+                }
 
-                            if (is_wp_error($embedding_result)) {
-                                // APIエラー
-                                echo '<div class="notice notice-error is-dismissible"><p>チャンク ' . ($index + 1) . ' のベクトル化に失敗しました: ' . esc_html($embedding_result->get_error_message()) . '</p></div>';
-                                $error_count++;
-                                continue; // 次のチャンクへ
-                            }
+                $vector_ids_to_delete = [];
+                if (isset($query_result['matches']) && !empty($query_result['matches'])) {
+                    $vector_ids_to_delete = array_map(fn($match) => $match['id'], $query_result['matches']);
+                }
 
-                            // 4. DB保存
-                            $vector_json = json_encode($embedding_result); // ベクトル配列をJSON文字列に変換
-
-                            $inserted = $wpdb->insert(
-                                $table_name,
-                                [
-                                    'source_text' => $chunk,
-                                    'vector_data' => $vector_json
-                                ],
-                                [
-                                    '%s', // source_text は文字列
-                                    '%s'  // vector_data も文字列 (JSON)
-                                ]
-                            );
-
-                            if ($inserted === false) {
-                                // DB挿入エラー
-                                echo '<div class="notice notice-error is-dismissible"><p>チャンク ' . ($index + 1) . ' のデータベース保存に失敗しました。DBエラー: ' . esc_html($wpdb->last_error) . '</p></div>';
-                                $db_error_count++;
-                            } else {
-                                $success_count++;
-                            }
-
-                            // （オプション）レートリミット対策で少し待機する
-                            // usleep(200000); // 0.2秒待機 (200,000マイクロ秒)
-                        }
-
-                        // 処理結果のサマリーを表示
-                        echo '<div class="notice notice-success is-dismissible"><p>処理完了: ' . $success_count . ' 個のチャンクをベクトル化しDBに保存しました。</p></div>';
-                        if ($error_count > 0) {
-                            echo '<div class="notice notice-warning is-dismissible"><p>' . $error_count . ' 個のチャンクでベクトル化エラーが発生しました。</p></div>';
-                        }
-                        if ($db_error_count > 0) {
-                            echo '<div class="notice notice-warning is-dismissible"><p>' . $db_error_count . ' 個のチャンクでデータベース保存エラーが発生しました。</p></div>';
-                        }
-                    } else {
-                        echo '<div class="notice notice-warning is-dismissible"><p>テキストをチャンクに分割できませんでした。</p></div>';
+                if (!empty($vector_ids_to_delete)) {
+                    // Pineconeからベクトルを削除
+                    $delete_result = $pinecone_client->deleteVectors($vector_ids_to_delete);
+                    if (is_wp_error($delete_result)) {
+                        throw new \Exception('Pineconeからのデータ削除に失敗: ' . $delete_result->get_error_message());
                     }
+                    echo '<div class="notice notice-success is-dismissible"><p>手動学習データ「' . esc_html($title_to_delete) . '」(' . count($vector_ids_to_delete) . 'ベクトル) を削除しました。</p></div>';
                 } else {
-                    echo '<div class="notice notice-warning is-dismissible"><p>入力されたテキストが空か、HTMLタグを除去したら空になりました。</p></div>';
+                    echo '<div class="notice notice-warning is-dismissible"><p>タイトル「' . esc_html($title_to_delete) . '」に紐づくベクトルデータが見つかりませんでした（削除処理スキップ）。</p></div>';
+                }
+            } catch (\Throwable $t) { // Throwable で捕捉
+                echo '<div class="notice notice-error is-dismissible"><p>削除処理中にエラーが発生しました: ' . esc_html($t->getMessage()) . '</p></div>';
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Manual delete error: ' . $t->getMessage());
+            }
+        } // --- 手動削除処理ここまで ---
+
+
+
+        $nonce_action_delete_auto = EDEL_AI_CHATBOT_PLUS_PREFIX . 'delete_auto_entry_nonce'; // HTMLのフォームと合わせる
+        $submit_name_delete_auto = 'delete_auto_entry'; // 削除ボタンの name 属性
+        // 削除ボタンが押され、投稿IDが送られ、Nonceが有効で、Pineconeクライアントが有効な場合
+        if ($pinecone_client && isset($_POST[$submit_name_delete_auto]) && isset($_POST['source_post_id']) && check_admin_referer($nonce_action_delete_auto)) {
+
+            $post_id_to_delete = absint($_POST['source_post_id']); // 念のため整数値に
+
+            if ($post_id_to_delete > 0) {
+                // 処理開始メッセージ
+                echo '<div id="message" class="notice notice-info is-dismissible"><p>投稿ID ' . esc_html($post_id_to_delete) . ' の学習データの削除処理を開始します...</p></div>';
+                if (function_exists('ob_flush')) {
+                    @ob_flush();
+                }
+                flush();
+
+                try {
+                    // 1. Pineconeから削除対象のベクトルIDリストを取得
+                    //    source_post_id でフィルタリングする
+                    $dummy_vector = array_fill(0, 1536, 0.0); // 次元数
+                    $filter = [
+                        // 'source_type' => ['$in' => ['post', 'page', ...]], // 必要ならタイプも指定
+                        'source_post_id' => ['$eq' => $post_id_to_delete] // ★ 投稿IDで絞り込み
+                    ];
+                    $limit = 10000; // 該当するIDを全て取得できる十分大きな数を指定 (Pineconeの上限も考慮)
+                    $query_result = $pinecone_client->query($dummy_vector, $limit, $filter, null, false, false); // IDのみ取得
+
+                    if (is_wp_error($query_result)) {
+                        throw new \Exception('削除対象IDの取得に失敗(Pinecone Query): ' . $query_result->get_error_message());
+                    }
+
+                    $vector_ids_to_delete = [];
+                    if (isset($query_result['matches']) && !empty($query_result['matches'])) {
+                        $vector_ids_to_delete = array_map(fn($match) => $match['id'], $query_result['matches']);
+                    }
+
+                    // 2. 削除対象IDがあれば削除APIを呼び出す
+                    if (!empty($vector_ids_to_delete)) {
+                        $delete_result = $pinecone_client->deleteVectors($vector_ids_to_delete);
+
+                        if (is_wp_error($delete_result)) {
+                            throw new \Exception('Pineconeからのデータ削除に失敗: ' . $delete_result->get_error_message());
+                        }
+                        // 成功メッセージ
+                        if (isset($post_id_to_delete) && $post_id_to_delete > 0) {
+                            delete_post_meta($post_id_to_delete, '_edel_ai_last_learned_gmt');
+                            delete_post_meta($post_id_to_delete, '_edel_ai_vector_count');
+                            delete_post_meta($post_id_to_delete, '_edel_ai_processed_gmt');
+                            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Post meta deleted for post ID: ' . $post_id_to_delete);
+                        }
+                        echo '<div class="notice notice-success is-dismissible"><p>投稿ID ' . esc_html($post_id_to_delete) . ' の学習データ (' . count($vector_ids_to_delete) . 'ベクトル) を削除しました。</p></div>';
+                    } else {
+                        // 対象データが見つからなかった場合
+                        echo '<div class="notice notice-warning is-dismissible"><p>投稿ID ' . esc_html($post_id_to_delete) . ' に紐づく学習データが見つかりませんでした（削除処理スキップ）。</p></div>';
+                    }
+                } catch (\Throwable $t) {
+                    // エラー発生時
+                    echo '<div class="notice notice-error is-dismissible"><p>削除処理中にエラーが発生しました: ' . esc_html($t->getMessage()) . '</p></div>';
+                    error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Auto delete error for post ID ' . $post_id_to_delete . ': ' . $t->getMessage());
                 }
             } else {
-                echo '<div class="notice notice-warning is-dismissible"><p>学習させるテキストを入力してください。</p></div>';
+                // 不正な投稿IDの場合
+                echo '<div class="notice notice-error is-dismissible"><p>削除対象の投稿IDが無効です。</p></div>';
             }
-        } // --- データ登録処理 ここまで ---
-        // --- フォーム表示 ---
-?>
+        } // --- 自動学習データ削除処理 ここまで ---
+
+        // 手動データ登録フォーム用のNonceアクション名とSubmitボタン名
+        $nonce_action_manual = EDEL_AI_CHATBOT_PLUS_PREFIX . 'manual_learn_nonce';
+        $submit_name_manual  = EDEL_AI_CHATBOT_PLUS_PREFIX . 'submit_manual_learn';
+
+        // --- 手動データ登録フォームが送信された場合の処理 ---
+        if (isset($_POST[$submit_name_manual]) && check_admin_referer($nonce_action_manual)) {
+
+            // 処理開始メッセージを表示
+            echo '<div id="message" class="notice notice-info is-dismissible"><p>手動学習データの処理を開始します...</p></div>';
+            // 出力を強制フラッシュ（長時間の処理中にメッセージを見せるため）
+            if (function_exists('ob_flush')) {
+                @ob_flush();
+            }
+            flush();
+
+            // 送信されたタイトルと本文を取得・サニタイズ
+            $manual_title = isset($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'manual_title']) ? sanitize_text_field(wp_unslash($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'manual_title'])) : '';
+            $manual_text  = isset($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'manual_text']) ? sanitize_textarea_field(wp_unslash($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'manual_text'])) : '';
+
+            // タイトルと本文が両方入力されているかチェック
+            if (!empty($manual_title) && !empty($manual_text)) {
+
+                // try...catch でエラー処理
+                try {
+                    // --- 必要な設定値を取得 ---
+                    $options = get_option($option_name, []);
+                    $openai_api_key       = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'] ?? '';
+                    $pinecone_api_key     = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_api_key'] ?? '';
+                    $pinecone_environment = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_environment'] ?? '';
+                    $pinecone_index_name  = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_index_name'] ?? '';
+                    $pinecone_host        = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_host'] ?? '';
+
+                    // 必須設定のチェック
+                    if (empty($openai_api_key) || empty($pinecone_api_key) || empty($pinecone_environment) || empty($pinecone_index_name) || empty($pinecone_host)) {
+                        throw new \Exception('OpenAI APIキーまたはPinecone設定が不足しています。設定ページを確認してください。');
+                    }
+
+                    // --- APIクライアント準備 ---
+                    // (class-admin.php の先頭に use 宣言が必要)
+                    // use Edel\AiChatbotPlus\API\EdelAiChatbotOpenAIAPI;
+                    // use Edel\AiChatbotPlus\API\EdelAiChatbotPlusPineconeClient;
+                    $openai_api      = new \Edel\AiChatbotPlus\API\EdelAiChatbotOpenAIAPI($openai_api_key);
+
+                    // --- 処理実行 ---
+                    // 1. 前処理
+                    $clean_text = trim(wp_strip_all_tags($manual_text));
+
+                    // 2. チャンキング
+                    $chunk_size = 500;
+                    $chunk_overlap = 50; // パラメータ
+                    // (chunk_text_fixed_lengthメソッドがこのクラスにあり、public/protectedである必要あり)
+                    $text_chunks = $this->chunk_text_fixed_length($clean_text, $chunk_size, $chunk_overlap);
+
+                    if (empty($text_chunks)) {
+                        throw new \Exception('テキストから有効なチャンクを生成できませんでした。');
+                    }
+
+                    // 3. ベクトル化とPineconeへの保存ループ
+                    $saved_chunks = 0;
+                    $errors = 0;
+                    $current_time_gmt = current_time('mysql', 1); // GMT時刻
+
+                    foreach ($text_chunks as $chunk_index => $chunk) {
+                        try {
+                            // ベクトル化
+                            $vector = $openai_api->get_embedding($chunk);
+                            if (is_wp_error($vector)) {
+                                throw new \Exception('ベクトル化失敗: ' . $vector->get_error_message());
+                            }
+
+                            // Pinecone用データ準備
+                            $vector_id = 'manual-' . time() . '-' . uniqid() . '-' . $chunk_index; // ユニークID
+                            $metadata = [
+                                'source_type'      => 'manual',         // ソースタイプ
+                                'source_post_id'   => 0,                // 投稿IDは 0
+                                'source_title'     => $manual_title,    // 入力タイトル
+                                'text_preview'     => mb_substr(preg_replace('/\s+/', ' ', $chunk), 0, 100), // プレビュー
+                                'modified_gmt'     => $current_time_gmt // 更新日時(GMT)
+                            ];
+
+                            // Pinecone へ Upsert
+                            $upsert_result = $pinecone_client->upsert($vector_id, $vector, $metadata);
+                            if (is_wp_error($upsert_result)) {
+                                throw new \Exception('Pinecone保存失敗: ' . $upsert_result->get_error_message());
+                            }
+                            $saved_chunks++;
+                            // usleep(200000); // レートリミット対策
+
+                        } catch (\Exception $e_chunk) { // ループ内の個別エラー
+                            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Manual learn chunk error for title [' . $manual_title . ']: ' . $e_chunk->getMessage());
+                            $errors++;
+                            // ループは継続させる
+                        }
+                    } // end foreach chunk
+
+                    // 完了メッセージを表示
+                    echo '<div class="notice notice-success is-dismissible"><p>手動学習データ「' . esc_html($manual_title) . '」の処理が完了しました。' . esc_html($saved_chunks) . '個のチャンクをPineconeに保存しました。' . ($errors > 0 ? ' (' . esc_html($errors) . ' エラー)' : '') . '</p></div>';
+                } catch (\Throwable $t) { // 処理全体のエラー (Throwableで捕捉)
+                    error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Manual learn processing error: ' . $t->getMessage() . ' in ' . $t->getFile() . ' on line ' . $t->getLine());
+                    echo '<div class="notice notice-error is-dismissible"><p>処理中にエラーが発生しました: ' . esc_html($t->getMessage()) . '</p></div>';
+                }
+            } else {
+                // タイトルまたは本文が空の場合のメッセージ
+                echo '<div class="notice notice-warning is-dismissible"><p>タイトルと本文の両方を入力してください。</p></div>';
+            }
+        } // --- 手動データ登録処理 ここまで ---
+
+        // --- フォームHTML表示 ---
+    ?>
         <div class="wrap">
-            <h1><?php echo esc_html(EDEL_AI_CHATBOT_PLUS_NAME); ?> - 学習データ登録</h1>
-            <p>ここにチャットボットに学習させたいテキスト（製品情報、FAQ、マニュアルなど）を貼り付けてください。HTMLタグは自動的に除去されます。</p>
+            <h1><?php echo esc_html(EDEL_AI_CHATBOT_PLUS_NAME); ?> - 手動学習データ登録</h1>
+            <p>特定の情報（例：短いFAQ、定型文、サイトコンテンツ以外の知識など）を直接チャットボットに学習させたい場合は、以下のフォームから登録できます。</p>
+
             <form method="POST">
-                <?php wp_nonce_field($nonce_action_learn); ?>
+                <?php wp_nonce_field($nonce_action_manual); // 新しいNonceアクション名
+                ?>
                 <table class="form-table">
                     <tr valign="top">
-                        <th scope="row"><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'learning_text'; ?>">学習テキスト</label></th>
+                        <th scope="row"><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'manual_title'; ?>">タイトル</label></th>
                         <td>
-                            <textarea id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'learning_text'; ?>"
-                                name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'learning_text'; ?>"
-                                rows="15"
+                            <input type="text"
+                                id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'manual_title'; ?>"
+                                name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'manual_title'; ?>"
+                                class="regular-text"
+                                required>
+                            <p class="description">この学習データのタイトルを入力してください（後で管理しやすくなります）。</p>
+                        </td>
+                    </tr>
+                    <tr valign="top">
+                        <th scope="row"><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'manual_text'; ?>">本文（学習内容）</label></th>
+                        <td>
+                            <textarea id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'manual_text'; ?>"
+                                name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'manual_text'; ?>"
+                                rows="10"
                                 class="large-text"
-                                placeholder="ここにテキストを貼り付け..."></textarea>
-                            <p class="description">入力されたテキストはチャンク（断片）に分割され、ベクトル化されてデータベースに保存されます。</p>
+                                required></textarea>
+                            <p class="description">チャットボットに学習させたい内容を入力してください。</p>
                         </td>
                     </tr>
                 </table>
-
                 <p class="submit">
                     <input type="submit"
-                        name="<?php echo $submit_name_learn; ?>"
+                        name="<?php echo $submit_name_manual; ?>"
                         class="button button-primary"
-                        value="学習データを登録・ベクトル化">
-                    <?php // 注意：現時点ではベクトル化とDB保存は行われません
-                    ?>
+                        value="手動でデータを登録・ベクトル化">
                 </p>
             </form>
+
+            <hr>
+
+            <h2>サイトコンテンツからの学習</h2>
+            <p>上記「自動学習設定」で指定された条件に基づき、サイト内の投稿や固定ページから情報を読み込み、ベクトル化してチャットボットの学習データとして登録します。<br>サイトのコンテンツ量によっては処理に時間がかかる場合があります。</p>
+            <p class="submit">
+                <button type="button"
+                    id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX; ?>start-learning-button"
+                    class="button button-primary">
+                    サイトコンテンツから学習を開始<span class="spinner" id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX; ?>learning-spinner" style="float: none; vertical-align: middle;"></span>
+                </button>
+            <div id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX; ?>learning-progress" style="margin-top: 1em; padding: 10px; border: 1px solid #ccc; background: #f9f9f9; min-height: 50px; display: none;">
+                <p style="margin:0;"><strong>処理状況:</strong> <span class="status">待機中...</span></p>
+                <div style="background: #eee; border-radius: 3px; overflow: hidden; margin-top: 5px;">
+                    <div class="progress-bar" style="width: 0%; background: #007bff; height: 10px; text-align: center; color: white; font-size: 8px; line-height: 10px;">0%</div>
+                </div>
+                <p style="margin:5px 0 0 0; font-size: smaller;" class="log"></p>
+            </div>
+
+            <hr>
+
+            <h2>登録済み手動データ</h2>
+            <?php
+            // Pineconeクライアントが準備できている場合のみリスト表示を試みる
+            if ($pinecone_client) {
+                // 手動登録データを取得 (タイトルと関連ID) - listManualEntriesはメタデータが必要
+                $manual_entries_result = $pinecone_client->listManualEntries(); // 取得上限に注意
+
+                if (is_wp_error($manual_entries_result)) {
+                    // データ取得失敗
+                    echo '<div class="notice notice-warning is-dismissible"><p>登録済みデータの取得に失敗しました: ' . esc_html($manual_entries_result->get_error_message()) . '</p></div>';
+                } elseif (empty($manual_entries_result)) {
+                    // データがまだない場合
+                    echo '<p>登録されている手動学習データはありません。</p>';
+                } else {
+                    // データがある場合はテーブル表示
+            ?>
+                    <table class="wp-list-table widefat striped fixed">
+                        <thead>
+                            <tr>
+                                <th scope="col" style="width: 60%;">タイトル</th> <?php // 列幅の目安
+                                                                                ?>
+                                <th scope="col" style="width: 15%;">ベクトル数</th>
+                                <th scope="col" style="width: 25%;">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($manual_entries_result as $entry): ?>
+                                <tr>
+                                    <td><?php echo esc_html($entry['title']); ?></td>
+                                    <td><?php echo count($entry['vector_ids']); ?></td>
+                                    <td>
+                                        <?php // 各行に削除用フォームを設置
+                                        ?>
+                                        <form method="POST" style="display: inline;">
+                                            <?php wp_nonce_field($nonce_action_delete_manual); ?>
+                                            <input type="hidden" name="entry_title" value="<?php echo esc_attr($entry['title']); ?>">
+                                            <input type="submit" name="delete_manual_entry" value="削除" class="button button-link-delete" onclick="return confirm('手動学習データ「<?php echo esc_js($entry['title']); ?>」を削除しますか？\nこの操作は元に戻せません。');">
+                                        </form>
+                                        <?php // (オプション) 編集ボタンなどをここに追加可能
+                                        ?>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+            <?php
+                } // end if empty/error check
+            } else {
+                // Pineconeクライアントが準備できていない場合のメッセージ
+                // (冒頭のエラーメッセージと重複する可能性あり)
+                // echo '<p>Pineconeの設定が完了していないため、登録済みデータを表示できません。</p>';
+            } // end if $pinecone_client
+            ?>
+
+            <hr>
+
+            <h2>学習済みサイトコンテンツ</h2>
+            <?php
+            if ($pinecone_client) { // Pineconeクライアントが有効な場合
+
+                $this->display_auto_learned_content_list();
+
+                // Pineconeから自動学習データを取得 (source_type が 'post' または 'page')
+                // ※ 自動学習対象のカスタム投稿タイプも増やす場合は、$in_types を動的に生成
+                $in_types = ['post', 'page'];
+                $filter = [
+                    'source_type' => ['$in' => $in_types] // type が post または page のもの
+                ];
+                // ダミーベクトルでフィルタ検索 (IDとメタデータを取得)
+                $dummy_vector = array_fill(0, 1536, 0.0);
+                $limit = 1000; // ★ 取得上限。全件取得できない可能性がある点に注意
+                $auto_data_result = $pinecone_client->query($dummy_vector, $limit, $filter, null, true, false); // メタデータ取得
+                // error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Pinecone Query Result (for auto-data list): ' . print_r($auto_data_result, true));
+
+                $auto_entries = []; // 投稿IDごとに集計するための配列
+                if (is_wp_error($auto_data_result)) {
+                    echo '<div class="notice notice-warning is-dismissible"><p>学習済みコンテンツデータの取得に失敗しました: ' . esc_html($auto_data_result->get_error_message()) . '</p></div>';
+                } elseif (isset($auto_data_result['matches']) && !empty($auto_data_result['matches'])) {
+                    // 取得したチャンクデータを投稿IDごとに集計
+                    foreach ($auto_data_result['matches'] as $match) {
+                        if (isset($match['metadata']['source_post_id']) && $match['metadata']['source_post_id'] > 0) {
+                            $post_id = (int) $match['metadata']['source_post_id'];
+                            if (!isset($auto_entries[$post_id])) {
+                                // 初めてのIDなら基本情報を初期化
+                                $auto_entries[$post_id] = [
+                                    'post_id'    => $post_id,
+                                    'title'      => $match['metadata']['source_title'] ?? get_the_title($post_id), // メタデータ優先、なければ取得
+                                    'type'       => $match['metadata']['source_type'] ?? get_post_type($post_id),
+                                    'modified'   => $match['metadata']['modified_gmt'] ?? '', // GMT想定
+                                    'chunk_count' => 0,
+                                    'vector_ids' => [] // (オプション) 削除用にIDを集める場合
+                                ];
+                            }
+                            $auto_entries[$post_id]['chunk_count']++;
+                            $auto_entries[$post_id]['vector_ids'][] = $match['id'];
+                        }
+                    }
+                }
+
+                // 集計結果を表示
+                if (empty($auto_entries)) {
+                    echo '<p>自動学習で登録されたデータはありません。</p>';
+                } else {
+            ?>
+                    <p>サイトの投稿や固定ページから自動的に学習されたデータの一覧です。</p>
+                    <table class="wp-list-table widefat striped fixed">
+                        <thead>
+                            <tr>
+                                <th scope="col">タイトル</th>
+                                <th scope="col">タイプ</th>
+                                <th scope="col">ベクトル数</th>
+                                <th scope="col">最終学習日時(GMT)</th>
+                                <th scope="col">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($auto_entries as $entry): ?>
+                                <tr>
+                                    <td>
+                                        <a href="<?php echo esc_url(get_edit_post_link($entry['post_id'])); ?>" target="_blank">
+                                            <?php echo esc_html($entry['title']); ?>
+                                        </a>
+                                        (ID: <?php echo esc_html($entry['post_id']); ?>)
+                                    </td>
+                                    <td><?php echo esc_html($entry['type']); ?></td>
+                                    <td><?php echo esc_html($entry['chunk_count']); ?></td>
+                                    <td><?php echo esc_html($entry['modified']); ?></td>
+                                    <td>
+                                        <?php // ★ 削除ボタン用フォーム ★
+                                        ?>
+                                        <form method="POST" style="display: inline;">
+                                            <?php // ★ 削除用Nonce (手動削除とは別のアクション名にする) ★
+                                            ?>
+                                            <?php wp_nonce_field(EDEL_AI_CHATBOT_PLUS_PREFIX . 'delete_auto_entry_nonce'); ?>
+                                            <?php // ★ 削除対象の投稿IDを隠しフィールドで渡す ★
+                                            ?>
+                                            <input type="hidden" name="source_post_id" value="<?php echo esc_attr($entry['post_id']); ?>">
+                                            <?php // ★ 削除実行を示す name 属性 ★
+                                            ?>
+                                            <input type="submit" name="delete_auto_entry" value="学習データ削除" class="button button-link-delete" onclick="return confirm('投稿「<?php echo esc_js($entry['title']); ?>」の学習データを削除しますか？\nこの操作は元に戻せません。');">
+                                        </form>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+            <?php
+                } // end if empty($auto_entries)
+            } // end if $pinecone_client
+            ?>
+
         </div>
     <?php
     } // end show_main_page()
@@ -621,7 +1543,7 @@ class EdelAiChatbotAdmin {
             // ★★★ Geminiモデル選択の保存 (例) ★★★
             // (今回は 'gemini-1.5-flash' 固定とするか、選択肢を作るか)
             $options_to_save[EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'] = isset($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'])
-                ? sanitize_key($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'])
+                ? sanitize_text_field($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'])
                 : 'gemini-1.5-flash'; // デフォルト
 
             if ($options_to_save[EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'] === 'openai') {
@@ -630,6 +1552,15 @@ class EdelAiChatbotAdmin {
                 // OpenAIモデル設定をクリアまたは保持 (どうするか決める)
                 // unset($options_to_save[EDEL_AI_CHATBOT_PLUS_PREFIX . 'model']);
             }
+
+            $options_to_save[EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_api_key'] = isset($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_api_key'])
+                ? sanitize_text_field(trim($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_api_key']))
+                : '';
+
+            // ★★★ Claude モデル選択の保存 ★★★
+            $options_to_save[EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_model'] = isset($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_model'])
+                ? sanitize_text_field($_POST[EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_model']) // モデル名はテキストとして保存
+                : 'claude-3-haiku-20240307'; // デフォルト Haiku
 
             // データベースにオプションを保存
             update_option($option_name, $options_to_save);
@@ -664,6 +1595,8 @@ class EdelAiChatbotAdmin {
         $google_api_key   = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'google_api_key'] ?? '';
         $selected_openai_model = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'model'] ?? 'gpt-3.5-turbo'; // OpenAI用
         $selected_gemini_model = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'] ?? 'gemini-1.5-flash'; // Gemini用
+        $claude_api_key = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_api_key'] ?? '';
+        $selected_claude_model = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_model'] ?? 'claude-3-haiku-20240307';
         // ★★★ 読み込み処理ここまで ★★★
 
     ?>
@@ -694,21 +1627,22 @@ class EdelAiChatbotAdmin {
                             <select id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'; ?>" name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'; ?>">
                                 <option value="openai" <?php selected($ai_service, 'openai'); ?>>OpenAI</option>
                                 <option value="gemini" <?php selected($ai_service, 'gemini'); ?>>Google Gemini</option>
+                                <option value="claude" <?php selected($ai_service, 'claude'); ?>>Anthropic Claude</option>
                             </select>
                             <p class="description">チャットの応答に使用するAIサービスを選択します。</p>
                         </td>
                     </tr>
 
-                    <?php // ★★★ OpenAI 設定 (Gemini選択時は非表示) ★★★
-                    ?>
-                    <tr class="openai-settings" style="<?php echo $ai_service !== 'openai' ? 'display: none;' : ''; ?>">
+                    <tr class="openai-settings service-settings" style="<?php echo $ai_service !== 'openai' ? 'display: none;' : ''; ?>">
                         <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'; ?>">OpenAI APIキー</label></th>
                         <td>
+                            <?php // ★ value で使う変数名が $api_key で正しいか確認 (読み込み部分と合わせる)
+                            ?>
                             <input type="password" id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'; ?>" name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'; ?>" value="<?php echo esc_attr($api_key); ?>" class="regular-text" autocomplete="new-password">
                             <p class="description">OpenAI Platform で取得したAPIキー。</p>
                         </td>
                     </tr>
-                    <tr class="openai-settings" style="<?php echo $ai_service !== 'openai' ? 'display: none;' : ''; ?>">
+                    <tr class="openai-settings service-settings" style="<?php echo $ai_service !== 'openai' ? 'display: none;' : ''; ?>">
                         <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'model'; ?>">OpenAI モデル</label></th>
                         <td>
                             <select id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'model'; ?>" name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'model'; ?>">
@@ -720,34 +1654,54 @@ class EdelAiChatbotAdmin {
                         </td>
                     </tr>
 
-                    <?php // ★★★ Google Gemini 設定 (OpenAI選択時は非表示) ★★★
-                    ?>
-                    <tr class="gemini-settings" style="<?php echo $ai_service !== 'gemini' ? 'display: none;' : ''; ?>">
+                    <tr class="gemini-settings service-settings" style="<?php echo $ai_service !== 'gemini' ? 'display: none;' : ''; ?>">
                         <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'google_api_key'; ?>">Google APIキー</label></th>
-                        <td>
-                            <input type="password" id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'google_api_key'; ?>" name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'google_api_key'; ?>" value="<?php echo esc_attr($google_api_key); ?>" class="regular-text" autocomplete="new-password">
+                        <td><input type="password"
+                                id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'google_api_key'; ?>"
+                                name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'google_api_key'; ?>"
+                                value="<?php echo esc_attr($google_api_key); ?>"
+                                class="regular-text"
+                                autocomplete="new-password">
                             <p class="description">Google AI Studio で取得したAPIキー。</p>
                         </td>
                     </tr>
-                    <tr class="gemini-settings" style="<?php echo $ai_service !== 'gemini' ? 'display: none;' : ''; ?>">
+                    <tr class="gemini-settings service-settings" style="<?php echo $ai_service !== 'gemini' ? 'display: none;' : ''; ?>">
                         <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'; ?>">Gemini モデル</label></th>
                         <td>
-                            <?php // 将来的に複数モデルに対応する場合は select にする
+                            <?php $gemini_models = ['gemini-1.5-flash' => 'Gemini 1.5 Flash']; // 他にも選択肢があれば追加
                             ?>
-                            <input type="text" id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'; ?>" name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'; ?>" value="<?php echo esc_attr($selected_gemini_model); ?>" readonly class="regular-text">
-                            (現在は gemini-1.5-flash 固定です)
+                            <select id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'; ?>" name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'gemini_model'; ?>">
+                                <?php foreach ($gemini_models as $value => $label) : ?>
+                                    <option value='<?php echo esc_attr($value); ?>' <?php selected($selected_gemini_model, $value); ?>><?php echo esc_html($label); ?></option>
+                                <?php endforeach; ?>
+                            </select>
                         </td>
                     </tr>
 
-                    <tr>
-                        <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'; ?>">OpenAI APIキー</label></th>
+                    <tr class="claude-settings service-settings" style="<?php echo $ai_service !== 'claude' ? 'display: none;' : ''; ?>">
+                        <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_api_key'; ?>">Anthropic APIキー</label></th>
                         <td>
-                            <input type="password"
-                                id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'; ?>"
-                                name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'api_key'; ?>"
-                                value="<?php echo esc_attr($api_key); ?>"
-                                class="regular-text">
-                            <p class="description">OpenAIのAPIキーを入力してください。</p>
+                            <input type="password" id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_api_key'; ?>" name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_api_key'; ?>" value="<?php echo esc_attr($claude_api_key); ?>" class="regular-text" autocomplete="new-password">
+                            <p class="description">Anthropicのコンソールで取得したAPIキー。</p>
+                        </td>
+                    </tr>
+                    <tr class="claude-settings service-settings" style="<?php echo $ai_service !== 'claude' ? 'display: none;' : ''; ?>">
+                        <th><label for="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_model'; ?>">Claude モデル</label></th>
+                        <td>
+                            <?php
+                            // 利用可能なClaudeモデルの例 (実際のモデルIDはAnthropicドキュメントで確認)
+                            $claude_models = [
+                                'claude-3-haiku-20240307' => 'Claude 3 Haiku',
+                                'claude-3-sonnet-20240229' => 'Claude 3 Sonnet',
+                                'claude-3-opus-20240229' => 'Claude 3 Opus'
+                            ];
+                            ?>
+                            <select id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_model'; ?>" name="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_model'; ?>">
+                                <?php foreach ($claude_models as $value => $label) : ?>
+                                    <option value='<?php echo esc_attr($value); ?>' <?php selected($selected_claude_model, $value); ?>><?php echo esc_html($label); ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                            <p class="description">利用するClaudeモデルを選択してください。</p>
                         </td>
                     </tr>
 
@@ -804,22 +1758,19 @@ class EdelAiChatbotAdmin {
                     jQuery(document).ready(function($) {
                         function toggleSettingsVisibility() {
                             const selectedService = $('#<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'; ?>').val();
+                            // まず全てのサービス設定行を隠す
+                            $('.service-settings').hide();
+                            // 選択されたサービスの設定行だけを表示
                             if (selectedService === 'openai') {
                                 $('.openai-settings').show();
-                                $('.gemini-settings').hide();
                             } else if (selectedService === 'gemini') {
-                                $('.openai-settings').hide();
                                 $('.gemini-settings').show();
-                            } else {
-                                // 念のため両方隠すなど
-                                $('.openai-settings').hide();
-                                $('.gemini-settings').hide();
+                            } else if (selectedService === 'claude') {
+                                $('.claude-settings').show();
                             }
                         }
-                        // 初期表示
-                        toggleSettingsVisibility();
-                        // 選択変更時
-                        $('#<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'; ?>').on('change', toggleSettingsVisibility);
+                        toggleSettingsVisibility(); // 初期表示
+                        $('#<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX . 'ai_service'; ?>').on('change', toggleSettingsVisibility); // 変更時
                     });
                 </script>
                 <hr>
@@ -976,23 +1927,6 @@ class EdelAiChatbotAdmin {
 
             <hr>
 
-            <h2>サイトコンテンツからの学習</h2>
-            <p>上記「自動学習設定」で指定された条件に基づき、サイト内の投稿や固定ページから情報を読み込み、ベクトル化してチャットボットの学習データとして登録します。<br>サイトのコンテンツ量によっては処理に時間がかかる場合があります。</p>
-            <p class="submit">
-                <button type="button"
-                    id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX; ?>start-learning-button"
-                    class="button button-primary">
-                    サイトコンテンツから学習を開始<span class="spinner" id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX; ?>learning-spinner" style="float: none; vertical-align: middle;"></span>
-                </button>
-            <div id="<?php echo EDEL_AI_CHATBOT_PLUS_PREFIX; ?>learning-progress" style="margin-top: 1em; padding: 10px; border: 1px solid #ccc; background: #f9f9f9; min-height: 50px; display: none;">
-                <p style="margin:0;"><strong>処理状況:</strong> <span class="status">待機中...</span></p>
-                <div style="background: #eee; border-radius: 3px; overflow: hidden; margin-top: 5px;">
-                    <div class="progress-bar" style="width: 0%; background: #007bff; height: 10px; text-align: center; color: white; font-size: 8px; line-height: 10px;">0%</div>
-                </div>
-                <p style="margin:5px 0 0 0; font-size: smaller;" class="log"></p>
-            </div>
-            <hr>
-
             <h2>学習データ管理</h2>
             <form method="POST" onsubmit="return confirm('本当に全ての学習データ（ベクトル）を削除しますか？この操作は元に戻せません。');">
                 <?php wp_nonce_field($nonce_action_delete); ?>
@@ -1019,14 +1953,17 @@ class EdelAiChatbotAdmin {
 
         $sql = "CREATE TABLE {$table_name} (
             id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
-            source_post_id bigint(20) UNSIGNED NOT NULL DEFAULT 0,
-            source_post_modified datetime NOT NULL DEFAULT '0000-00-00 00:00:00', /* ★ 追加: 元投稿の最終更新日時 */
-            source_text longtext NOT NULL,
-            vector_data longtext NOT NULL,
-            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            source_post_id bigint(20) UNSIGNED NOT NULL DEFAULT 0, /* 投稿ID (手動なら0) */
+            source_type varchar(20) NOT NULL DEFAULT '', /* ★追加: ソース種別 (post, page, manual など) */
+            source_title text NULL, /* ★追加: ソースタイトル (手動入力用など) */
+            source_post_modified datetime NOT NULL DEFAULT '0000-00-00 00:00:00', /* 投稿更新日時 */
+            source_text longtext NOT NULL, /* チャンクテキスト */
+            vector_data longtext NOT NULL, /* ベクトルデータ (JSON) */
+            created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP, /* データ作成日時 */
             PRIMARY KEY  (id),
-            INDEX idx_source_post_id (source_post_id), /* 既存のインデックス */
-            INDEX idx_source_post_modified (source_post_modified) /* ★ 追加: 更新日時にもインデックス推奨 */
+            INDEX idx_source_post_id (source_post_id), /* 既存インデックス */
+            INDEX idx_source_post_modified (source_post_modified), /* 既存インデックス */
+            INDEX idx_source_type (source_type) /* ★追加: タイプでの検索用インデックス */
         ) {$charset_collate};";
 
         // MySQLi のエラー例外を無効化

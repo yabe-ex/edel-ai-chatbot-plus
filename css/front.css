@@ -12,10 +12,14 @@
 
 /* チャット起動ボタン (アイコン) */
 .edel-chatbot-open-button {
+    position: absolute;
     background-color: #007bff; /* 例: 青色 */
     color: white;
     border: none;
     border-radius: 50%; /* 円形 */
+    background: none !important; /* 以前の修正 */
+    border: none !important;
+    padding: 8px !important;
     width: 60px; /* ボタンサイズ */
     height: 60px; /* ボタンサイズ */
     font-size: 24px; /* アイコンサイズ調整 */
@@ -218,18 +222,47 @@
     line-height: 1.4;
     box-sizing: border-box; /* padding, border を含めて高さを計算 */
 }
-.edel-chatbot-submit-button {
-    background: none;
-    border: none;
-    padding: 8px; /* クリック領域確保 */
+
+#edel_ai_chatbot_plus_widget-container .edel-chatbot-submit-button {
+    /* ★ 競合しやすいスタイルをリセット/初期化 ★ */
+    background: none !important; /* 背景色を強制的に透明に */
+    border: none !important;     /* 枠線を強制的に無しに */
+    padding: 8px !important;     /* 内側余白を再設定 (クリック領域確保のため調整) */
+    margin: 0;                   /* 外側余白リセット */
+    margin-left: 5px;            /* 左側の余白だけ再設定 */
+    box-shadow: none !important; /* 影を強制的に無しに */
+    text-decoration: none !important; /* テキスト装飾を解除 */
+    appearance: none !important; /* ブラウザやテーマのデフォルトスタイルを解除 */
+    -webkit-appearance: none;    /* ベンダープレフィックス */
+    -moz-appearance: none;
+
+    /* ★ 意図するスタイルを再指定 ★ */
+    color: #007bff !important; /* アイコンの色 (必要なら !important) */
+    font-size: 20px;          /* アイコンのサイズ */
+    line-height: 1;           /* ボタンの高さを行の高さに合わせる */
     cursor: pointer;
-    color: #007bff;
-    font-size: 20px;
-    line-height: 1; /* ボタン高さ調整 */
-    margin-left: 5px;
-    /* margin-bottom: 2px; */
-    flex-shrink: 0; /* ボタンは縮まない */
+    flex-shrink: 0;           /* フォーム内で縮まないように */
+    display: inline-flex;     /* アイコンを中央揃えしやすくするため */
+    align-items: center;
+    justify-content: center;
+    vertical-align: middle;   /* 他の要素との垂直位置合わせ */
 }
+
+/* ボタン内のSVGアイコンの色をボタンの文字色(color)に合わせる */
+#edel_ai_chatbot_plus_widget-container .edel-chatbot-submit-button svg {
+    fill: currentColor; /* ★ これで color プロパティの色が適用される */
+    width: 1em;  /* font-size に連動 */
+    height: 1em; /* font-size に連動 */
+    display: block;
+}
+
+/* (オプション) ホバー時のスタイル */
+#edel_ai_chatbot_plus_widget-container .edel-chatbot-submit-button:hover {
+    background: none; /* ホバー時も背景は変えない */
+    color: #0056b3; /* アイコンの色だけ少し濃くするなど */
+    opacity: 0.8;   /* または少し透過させる */
+}
+
 /* ローディングスタイル */
 .edel-chatbot-loading {
     display: none;

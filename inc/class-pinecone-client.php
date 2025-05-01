@@ -1,6 +1,11 @@
 <?php
 
-namespace Edel\AiChatbotPlus\API; // 名前空間 (APIサブ名前空間を使う例)
+namespace Edel\AiChatbotPlus\API;
+
+use \WP_Error;
+use \Exception;
+use \Throwable;
+use \InvalidArgumentException;
 
 // Exit if accessed directly.
 if (!defined('ABSPATH')) exit();
@@ -189,5 +194,156 @@ class EdelAiChatbotPlusPineconeClient {
         }
     } // end upsert()
 
+    /**
+     * 手動登録された学習データのエントリ（タイトルと関連ID）を取得する (簡易版)
+     * 注意: Pineconeのqueryはベクトル類似度検索が主目的のため、全件リスト取得には工夫が必要な場合がある。
+     * ここではフィルタを使ってメタデータのみ取得を試みる。
+     *
+     * @param string|null $namespace 名前空間 (オプション)
+     * @param int $limit 取得する最大件数（多めに指定）
+     * @return array|WP_Error 成功時は ['title' => '...', 'vector_ids' => [...], 'first_id' => ...] の配列, 失敗時は WP_Error
+     */
+    public function listManualEntries(?string $namespace = null, int $limit = 1000) {
+        $query_url = $this->host_url . '/query';
 
+        // ダミーのゼロベクトル（フィルタのみで検索するため）
+        // Pineconeの次元数に合わせてゼロ配列を生成する必要がある。コンストラクタなどで次元数を保持すると良いかも。
+        // ここでは仮に1536次元とする
+        $dummy_vector = array_fill(0, 1536, 0.0);
+
+        // APIリクエストのボディを作成
+        $payload = [
+            'vector'          => $dummy_vector, // ダミーベクトル
+            'topK'            => $limit,       // 取得件数（上限）
+            'filter'          => [              // ★ メタデータフィルタ ★
+                'source_type' => ['$eq' => 'manual'] // source_type が 'manual' のもの
+            ],
+            'includeMetadata' => true,         // メタデータは必須
+            'includeValues'   => false,        // ベクトル値は不要
+        ];
+        if ($namespace !== null) {
+            $payload['namespace'] = $namespace;
+        }
+
+        $args = [
+            'method'      => 'POST',
+            'headers'     => ['Content-Type' => 'application/json', 'Api-Key' => $this->api_key, 'Accept' => 'application/json'],
+            'body'        => json_encode($payload),
+            'data_format' => 'body',
+            'timeout'     => 30, // リスト取得なので少し長めでも
+        ];
+
+        error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Listing manual entries from Pinecone...');
+        $response = wp_remote_post($query_url, $args);
+
+        // レスポンスチェック
+        if (is_wp_error($response)) {
+            // ★★★ WP_Error の具体的な処理 ★★★
+            $error_code = 'pinecone_list_request_failed'; // 独自のエラーコード
+            // 元のエラーメッセージを含めてログと戻り値のメッセージを作成
+            $error_message = 'Pineconeへのリスト取得リクエスト送信に失敗しました。詳細: ' . $response->get_error_message();
+            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Pinecone listManualEntries WP_Error: ' . $error_message);
+            // 戻り値のWP_Errorにも元のエラーデータを格納
+            return new \WP_Error($error_code, $error_message, $response->get_error_data());
+            // ★★★ ここまで修正 ★★★
+        }
+        $response_code = wp_remote_retrieve_response_code($response);
+        $response_body = wp_remote_retrieve_body($response);
+        $decoded_body = json_decode($response_body, true);
+
+        if ($response_code === 200 && isset($decoded_body['matches'])) {
+            // 取得成功、タイトルごとにIDをまとめる
+            $entries = [];
+            foreach ($decoded_body['matches'] as $match) {
+                if (isset($match['metadata']['source_title']) && !empty($match['metadata']['source_title'])) {
+                    $title = $match['metadata']['source_title'];
+                    $vector_id = $match['id'] ?? null;
+                    if ($vector_id) {
+                        if (!isset($entries[$title])) {
+                            $entries[$title] = ['title' => $title, 'vector_ids' => [], 'first_id' => $vector_id]; // 最初のIDも保持
+                        }
+                        $entries[$title]['vector_ids'][] = $vector_id;
+                    }
+                }
+            }
+            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Found ' . count($entries) . ' unique manual entry titles.');
+            // キーをリセットして通常の配列にする
+            return array_values($entries);
+        } else {
+            // 失敗処理
+            $error_message = 'Pineconeからのリスト取得(Query)に失敗しました。';
+            if (isset($decoded_body['error']['message'])) { // Pinecone v3 APIエラー形式?
+                $error_message .= ' Pinecone Error: (' . ($decoded_body['error']['code'] ?? 'unknown') . ') ' . $decoded_body['error']['message'];
+            } elseif ($response_body) {
+                $error_message .= ' Response Body: ' . substr(esc_html($response_body), 0, 200) . '...';
+            }
+
+            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Pinecone listManualEntries Error: Code ' . $response_code . ' Body: ' . $response_body);
+            return new \WP_Error('pinecone_list_failed', $error_message, ['status' => $response_code, 'body' => $decoded_body]);
+        }
+    } // end listManualEntries()
+
+
+    /**
+     * 指定されたIDのベクトルをPineconeから削除する
+     *
+     * @param array $vectorIds 削除するベクトルIDの配列
+     * @param string|null $namespace 名前空間 (オプション)
+     * @return true|WP_Error 成功時は true, 失敗時は WP_Error
+     */
+    public function deleteVectors(array $vectorIds, ?string $namespace = null) {
+        if (empty($vectorIds)) {
+            return new \WP_Error('invalid_argument', '削除するベクトルIDが指定されていません。');
+        }
+        $delete_url = $this->host_url . '/vectors/delete';
+
+        // APIリクエストのボディを作成
+        $payload = [
+            'ids' => $vectorIds,
+        ];
+        if ($namespace !== null) {
+            $payload['namespace'] = $namespace;
+        }
+        // ★ メタデータフィルタでの削除も可能: $payload['filter'] = ['source_title' => ['$eq' => '削除したいタイトル']];
+
+        $args = [ /* ... (headers, timeout など upsert/query と同様) ... */
+            'method'      => 'POST', // ★ Delete も POST の場合がある (ドキュメント確認) または 'DELETE'
+            'headers'     => ['Content-Type' => 'application/json', 'Api-Key' => $this->api_key, 'Accept' => 'application/json'],
+            'body'        => json_encode($payload),
+            'data_format' => 'body',
+            'timeout'     => 30,
+        ];
+
+        error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Deleting vectors from Pinecone: ' . implode(', ', $vectorIds));
+        $response = wp_remote_post($delete_url, $args); // または wp_remote_request($delete_url, ['method' => 'DELETE', ...])
+
+        // レスポンスチェック
+        if (is_wp_error($response)) {
+            $error_code = 'pinecone_delete_request_failed'; // 独自のエラーコード
+            // 元のエラーメッセージを含めてログと戻り値のメッセージを作成
+            $error_message = 'Pineconeへの削除リクエスト送信に失敗しました。詳細: ' . $response->get_error_message();
+            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Pinecone Delete WP_Error: ' . $error_message);
+            // 戻り値のWP_Errorにも元のエラーデータを格納
+            return new \WP_Error($error_code, $error_message, $response->get_error_data());
+        }
+        $response_code = wp_remote_retrieve_response_code($response);
+        $response_body = wp_remote_retrieve_body($response);
+        $decoded_body = json_decode($response_body, true);
+
+        // Delete API は成功時 200 OK で、ボディは空 {} のことが多い
+        if ($response_code === 200) {
+            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Pinecone Delete Success.');
+            return true;
+        } else {
+            $error_message = 'Pineconeからのベクトル削除(Delete)に失敗しました。';
+            if (isset($decoded_body['error']['message'])) { // Pinecone v3 APIエラー形式?
+                $error_message .= ' Pinecone Error: (' . ($decoded_body['error']['code'] ?? 'unknown') . ') ' . $decoded_body['error']['message'];
+            } elseif ($response_body) {
+                $error_message .= ' Response Body: ' . substr(esc_html($response_body), 0, 200) . '...';
+            }
+
+            error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Pinecone Delete Error: Code ' . $response_code . ' Body: ' . $response_body . ' for IDs: ' . implode(', ', $vectorIds));
+            return new \WP_Error('pinecone_delete_failed', $error_message, ['status' => $response_code, 'body' => $decoded_body]);
+        }
+    } // end deleteVectors()
 } // End Class

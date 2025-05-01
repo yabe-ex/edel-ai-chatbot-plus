@@ -27,6 +27,45 @@ class EdelAiChatbotFront {
             'action'   => EDEL_AI_CHATBOT_PLUS_PREFIX . 'send_message' // Ajaxアクション名
         );
         wp_localize_script(EDEL_AI_CHATBOT_PLUS_SLUG . '-front', 'edel_chatbot_params', $localized_data);
+
+        // 1. デフォルトのスタイル値を配列で定義
+        $default_button_styles = [
+            'bottom'           => '20px',   // デフォルトの下からの位置
+            'right'            => '20px',   // 右からの位置も調整可能にするなら追加
+            'background_color' => '#007bff'  // デフォルトの背景色 (front.cssでの指定と合わせる)
+            // 他にも調整したいプロパティがあればここに追加可能 (例: 'width', 'height')
+        ];
+
+        // 2. apply_filters で外部からスタイル配列を変更可能にする
+        //    フック名: edel_ai_chatbot_plus_open_button_styles
+        //    引数1: フィルター対象の配列 ($default_button_styles)
+        //    引数2: (オプション) フックに渡す追加引数 (今回はなし)
+        $button_styles = apply_filters('edel_ai_chatbot_plus_open_button_styles', $default_button_styles);
+
+        // 3. フィルター後の値を使ってインラインCSS文字列を生成
+        $custom_css = '';
+        $button_selector = '#' . EDEL_AI_CHATBOT_PLUS_PREFIX . 'open-button'; // ボタンのCSSセレクタ
+
+        // issetでキーの存在を確認してからCSSを生成
+        if (isset($button_styles['bottom']) && !empty(trim($button_styles['bottom']))) {
+            $custom_css .= $button_selector . ' { bottom: ' . esc_attr(trim($button_styles['bottom'])) . ' !important; }' . "\n"; // !important で優先度を上げる
+        }
+        if (isset($button_styles['right']) && !empty(trim($button_styles['right']))) {
+            $custom_css .= $button_selector . ' { right: ' . esc_attr(trim($button_styles['right'])) . ' !important; }' . "\n";
+        }
+        if (isset($button_styles['background_color']) && !empty(trim($button_styles['background_color']))) {
+            $custom_css .= $button_selector . ' { background-color: ' . esc_attr(trim($button_styles['background_color'])) . ' !important; }' . "\n";
+            // 背景色が変わるなら、ホバー時の色なども調整が必要になる場合がある
+            // $custom_css .= $button_selector . ':hover { background-color: ' . esc_attr(adjust_brightness($button_styles['background_color'], -20)) . ' !important; }'; // 例: 少し暗くする
+        }
+        // 他のプロパティも同様に追加可能
+
+        // 4. 生成したCSSが空でなければ、wp_add_inline_styleで追加
+        if (!empty($custom_css)) {
+            // 第1引数: インラインCSSを追加する対象のスタイルシートのハンドル名 ('edel-ai-chatbot-plus-front')
+            // 第2引数: 追加するCSS文字列
+            wp_add_inline_style(EDEL_AI_CHATBOT_PLUS_SLUG . '-front', $custom_css);
+        }
     }
 
     /**
@@ -183,11 +222,20 @@ class EdelAiChatbotFront {
             $pinecone_index_name  = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_index_name'] ?? '';
             $pinecone_host        = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'pinecone_host'] ?? '';
 
+            $claude_api_key        = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_api_key'] ?? '';
+            $claude_model          = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_model'] ?? 'claude-3-haiku-20240307'; // デフォルトモデルも指定
+
+            $system_prompt = "あなたは親切なAIアシスタントです。提供された情報を元に、ユーザーの質問に日本語で回答してください。情報がない場合は、正直に「分かりません」と答えてください。";
+            $bot_response = '';
+
             if ($ai_service === 'openai' && empty($openai_api_key)) {
                 throw new \Exception('OpenAI APIキーが設定されていません。');
             }
             if ($ai_service === 'gemini' && empty($google_api_key)) {
                 throw new \Exception('Google APIキーが設定されていません。');
+            }
+            if ($ai_service === 'claude' && empty($claude_api_key)) {
+                throw new \Exception('Anthropic Claude APIキーが設定されていません。');
             }
 
             if (empty($api_key) || empty($pinecone_api_key) || empty($pinecone_environment) || empty($pinecone_index_name) || empty($pinecone_host)) {
@@ -279,38 +327,46 @@ class EdelAiChatbotFront {
 
             // --- (d) 応答生成 ---
             error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Calling get_chat_completion...'); // Chat API呼び出し前のログ
-            $bot_response =  '';
 
             if ($ai_service === 'gemini') {
                 // === Google Gemini の場合 ===
-                // APIクライアント準備 (Gemini Chat用)
                 require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-google-gemini-api.php';
                 $gemini_api = new \Edel\AiChatbotPlus\API\EdelAiChatbotPlusGeminiAPI($google_api_key);
-
-                // プロンプトを Gemini API の contents 形式に変換
                 $prompt_text = $context_text . "\n\nユーザーの質問:\n" . $user_message;
-                $gemini_contents = [
-                    [
-                        'role' => 'user', // userロールにコンテキストと質問を入れる
-                        'parts' => [['text' => $prompt_text]]
-                    ]
-                    // 必要ならシステム指示を別の形で追加（モデルによる）
-                ];
+                // Gemini は system role を messages に含めない方が安定する場合がある
+                $gemini_contents = [['role' => 'user', 'parts' => [['text' => $system_prompt . "\n\n" . $prompt_text]]]]; // System指示をuserに含める
+                // または $gemini_contents = [ ['role' => 'user', 'parts' => [['text' => $prompt_text]]] ]; (systemは別途渡さない)
+
                 error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Calling Gemini API (' . $gemini_chat_model . ')');
                 $bot_response_or_error = $gemini_api->generateContent($gemini_contents, $gemini_chat_model);
+            } elseif ($ai_service === 'claude') { // ★★★ Claude の処理分岐を追加 ★★★
+                // === Anthropic Claude の場合 ===
+                require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-anthropic-claude-api.php';
+                $claude_api = new \Edel\AiChatbotPlus\API\EdelAiChatbotPlusClaudeAPI($claude_api_key);
+                // Claude は messages 配列 と system パラメータを別に渡せる
+                $claude_messages = [
+                    // ★ Claude は user から始めることが多い ★
+                    ['role' => 'user', 'content' => $context_text . "\n\nユーザーの質問:\n" . $user_message]
+                    // 必要に応じて過去の assistant 応答もここに追加できる
+                ];
+                $claude_model = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'claude_model'] ?? 'claude-3-haiku-20240307'; // 設定からモデル取得
+
+                error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Calling Claude API (' . $claude_model . ')');
+                // createMessage(messages, model, max_tokens, temperature, system)
+                $bot_response_or_error = $claude_api->createMessage($claude_messages, $claude_model, 1024, 0.7, $system_prompt);
             } else {
                 // === OpenAI の場合 (デフォルト) ===
-                // APIクライアント準備 (OpenAI Chat用 - Embeddingと同じキーを使う)
-                $openai_chat_client = $openai_embedding_client; // 同じインスタンスでOK
-
-                // プロンプトを OpenAI API の messages 形式に変換
+                // require_once は最初の方で実行済みのはず
+                $openai_chat_client = new \Edel\AiChatbotPlus\API\EdelAiChatbotOpenAIAPI($openai_api_key); // use宣言があれば短い名前で
+                // OpenAI 用の messages 配列
                 $openai_messages = [
-                    ['role' => 'system', 'content' => "あなたは親切なAIアシスタントです。提供された情報を元に、ユーザーの質問に日本語で回答してください。情報がない場合は、正直に「分かりません」と答えてください。"],
+                    ['role' => 'system', 'content' => $system_prompt],
                     ['role' => 'user', 'content' => $context_text . "\n\nユーザーの質問:\n" . $user_message]
                 ];
                 error_log(EDEL_AI_CHATBOT_PLUS_PREFIX . ' Calling OpenAI Chat API (' . $openai_chat_model . ')');
                 $bot_response_or_error = $openai_chat_client->get_chat_completion($openai_messages, $openai_chat_model);
             }
+
             // API応答チェック
             if (is_wp_error($bot_response_or_error)) {
                 throw new \Exception('AIからの応答生成に失敗しました: ' . $bot_response_or_error->get_error_message());

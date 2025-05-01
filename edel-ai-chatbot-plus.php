@@ -24,6 +24,7 @@ use Edel\AiChatbotPlus\Front\EdelAiChatbotFront;
 use Edel\AiChatbotPlus\API\EdelAiChatbotOpenAIAPI;
 use Edel\AiChatbotPlus\API\EdelAiChatbotPlusPineconeClient;
 use Edel\AiChatbotPlus\API\EdelAiChatbotPlusGeminiAPI;
+use Edel\AiChatbotPlus\API\EdelAiChatbotPlusClaudeAPI;
 use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
 
 $info = get_file_data(__FILE__, array('plugin_name' => 'Plugin Name', 'version' => 'Version'));
@@ -42,6 +43,7 @@ require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-front.php';
 require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-openai-api.php';
 require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-pinecone-client.php';
 require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-google-gemini-api.php';
+require_once EDEL_AI_CHATBOT_PLUS_PATH . '/inc/class-anthropic-claude-api.php';
 
 register_activation_hook(__FILE__, array(Admin\EdelAiChatbotAdmin::class, 'create_custom_table'));
 
@@ -60,7 +62,15 @@ class EdelAiChatbotPlus {
         add_action('admin_enqueue_scripts', array($this->admin_instance, 'admin_enqueue'));
 
         $learning_action_hook = EDEL_AI_CHATBOT_PLUS_PREFIX . 'process_post_learning';
-        add_action($learning_action_hook, array($this->admin_instance, 'process_single_post_learning'), 10, 1);
+        add_action($learning_action_hook, array($this->admin_instance, 'process_single_post_learning_cron'), 10, 1); // ← _cron を指定
+
+        // ★ Ajaxループ用アクションフック (変更なし、handle_batch_learning_ajax を呼ぶ) ★
+        $batch_ajax_action = EDEL_AI_CHATBOT_PLUS_PREFIX . 'batch_learning';
+        add_action('wp_ajax_' . $batch_ajax_action, array($this->admin_instance, 'handle_batch_learning_ajax'));
+
+        // ★ admin_action フック (変更なし、handle_learn_single_post_action を呼ぶ) ★
+        $learn_action_name = EDEL_AI_CHATBOT_PLUS_PREFIX . 'learn_post';
+        add_action('admin_action_' . $learn_action_name, array($this->admin_instance, 'handle_learn_single_post_action'));
 
         add_action('wp_enqueue_scripts', array($this->front_instance, 'front_enqueue'));
         add_action('wp_footer', array($this->front_instance, 'output_floating_chatbot_ui'));
@@ -71,6 +81,29 @@ class EdelAiChatbotPlus {
 
         $batch_ajax_action = EDEL_AI_CHATBOT_PLUS_PREFIX . 'batch_learning'; // JSで指定したaction名
         add_action('wp_ajax_' . $batch_ajax_action, array($this->admin_instance, 'handle_batch_learning_ajax'));
+
+        $learn_action_name = EDEL_AI_CHATBOT_PLUS_PREFIX . 'learn_post';
+        add_action('admin_action_' . $learn_action_name, array($this->admin_instance, 'handle_learn_single_post_action'));
+
+        add_action('admin_notices', array($this->admin_instance, 'display_admin_notices'));
+
+        if (is_admin()) {
+            add_filter('post_row_actions', array($this->admin_instance, 'add_post_row_actions'), 10, 2); // 投稿用
+            add_filter('page_row_actions', array($this->admin_instance, 'add_post_row_actions'), 10, 2); // 固定ページ用
+
+            $option_name = EDEL_AI_CHATBOT_PLUS_PREFIX . 'settings';
+            $options = get_option($option_name, []);
+            $learning_post_types = $options[EDEL_AI_CHATBOT_PLUS_PREFIX . 'learning_post_types'] ?? ['post', 'page']; // デフォルト
+
+            if (!empty($learning_post_types) && is_array($learning_post_types)) {
+                foreach ($learning_post_types as $post_type) {
+                    // 列を追加するフィルター
+                    add_filter('manage_' . $post_type . '_posts_columns', array($this->admin_instance, 'add_ai_status_column'));
+                    // 列の内容を表示するアクション
+                    add_action('manage_' . $post_type . '_posts_custom_column', array($this->admin_instance, 'display_ai_status_column'), 10, 2);
+                }
+            }
+        }
     }
 }
 
